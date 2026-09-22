@@ -22,10 +22,12 @@ import { deploymentsRouter } from './modules/deployments/routes.js';
 import { usageRouter } from './modules/usage/routes.js';
 import { activityRouter } from './modules/activity/routes.js';
 import { notificationsRouter } from './modules/notifications/routes.js';
+import { storageRouter } from './modules/storage/routes.js';
 import { internalRouter } from './modules/internal/routes.js';
 import { realtimeRouter } from './realtime/routes.js';
 
 export const app = new Hono();
+
 
 // Global Middlewares
 app.use('*', requestIdMiddleware);
@@ -93,5 +95,7 @@ v1.route('/activity', activityRouter);
 v1.route('/notifications', notificationsRouter);
 v1.route('/internal', internalRouter);
 v1.route('/realtime', realtimeRouter);
+v1.route('/storage', storageRouter);
 
 app.route('/v1', v1);
+

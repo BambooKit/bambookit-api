@@ -13,8 +13,10 @@ const envSchema = z.object({
   ENCRYPTION_KEY: z.string().min(32).default('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'),
   CORS_ORIGINS: z.string().default('http://localhost:3000,http://localhost:3001'),
   DEV_AUTH_ENABLED: z.string().transform((val) => val === 'true').default('true'),
+  GCP_PROJECT_ID: z.string().default('bambookit-product'),
   GOOGLE_CLIENT_ID: z.string().optional(),
   GOOGLE_CLIENT_SECRET: z.string().optional(),
+  GOOGLE_REDIRECT_URI: z.string().default('http://localhost:3000/api/auth/callback/google'),
 });
 
 export type Env = z.infer<typeof envSchema>;

@@ -44,9 +44,9 @@ const taskId = 'task_auth_google_01';
 export const INITIAL_SEED_DATA: SeedData = {
   user: {
     id: userId,
-    email: 'satyam@bambookit.dev',
+    email: 'satyampote9999@gmail.com',
     passwordHash: '$2a$10$abcdefghijklmnopqrstuvwxyz1234567890', // placeholder bcrypt
-    name: 'Satyam',
+    name: 'Satyam Pote',
     avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=128&auto=format&fit=crop&q=80',
     createdAt: new Date('2026-08-15T10:00:00Z'),
     updatedAt: new Date('2026-08-15T10:00:00Z'),

@@ -14,7 +14,7 @@ const createTaskSchema = z.object({
   projectId: z.string(),
   agentId: z.string(),
   title: z.string().min(3),
-  prompt: z.string().min(5),
+  prompt: z.string().optional(),
   executionMode: z.enum(['CLOUD', 'LOCAL']).default('CLOUD'),
 });
 
@@ -55,7 +55,7 @@ tasksRouter.post('/', zValidator('json', createTaskSchema), (c) => {
     projectId: body.projectId,
     agentId: body.agentId,
     title: body.title,
-    prompt: body.prompt,
+    prompt: body.prompt || body.title,
     status: 'QUEUED' as const,
     executionMode: body.executionMode,
     branch: `feat/task-${Date.now().toString().slice(-4)}`,
