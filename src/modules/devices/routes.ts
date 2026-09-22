@@ -63,3 +63,26 @@ devicesRouter.post('/:id/revoke', (c) => {
 
   return c.json({ data: revoked, message: 'Device authorization revoked', requestId: c.get('requestId') });
 });
+
+// GET /v1/devices/:id/commands (Desktop polls remote commands)
+devicesRouter.get('/:id/commands', (c) => {
+  const deviceId = c.req.param('id');
+  memoryDb.data.deviceCommands = memoryDb.data.deviceCommands || [];
+  const pending = memoryDb.data.deviceCommands.filter((cmd) => cmd.deviceId === deviceId && cmd.status === 'QUEUED');
+
+  return c.json({ data: pending, requestId: c.get('requestId') });
+});
+
+// POST /v1/devices/:id/commands/:cmdId/ack (Desktop acknowledges command execution)
+devicesRouter.post('/:id/commands/:cmdId/ack', (c) => {
+  const { id: deviceId, cmdId } = c.req.param();
+  memoryDb.data.deviceCommands = memoryDb.data.deviceCommands || [];
+  const cmd = memoryDb.data.deviceCommands.find((c) => c.id === cmdId && c.deviceId === deviceId);
+  if (cmd) {
+    cmd.status = 'COMPLETED';
+    cmd.completedAt = new Date().toISOString();
+  }
+
+  return c.json({ success: true, requestId: c.get('requestId') });
+});
+

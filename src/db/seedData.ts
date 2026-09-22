@@ -33,6 +33,8 @@ export interface SeedData {
   usage: typeof usageRecords.$inferSelect;
   notifications: (typeof notifications.$inferSelect)[];
   auditLog: (typeof auditEvents.$inferSelect)[];
+  sessions: any[];
+  deviceCommands: any[];
 }
 
 const userId = 'usr_satyam_99';
@@ -430,4 +432,6 @@ export const INITIAL_SEED_DATA: SeedData = {
       createdAt: new Date('2026-09-22T03:13:10Z'),
     },
   ],
+  sessions: [],
+  deviceCommands: [],
 };

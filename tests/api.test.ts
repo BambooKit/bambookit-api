@@ -130,4 +130,49 @@ describe('BambooKit API End-to-End Suite', () => {
       expect(json.data.status).toBe('STARTING');
     });
   });
+
+  describe('OpenCode Sessions & Cross-Device Remote Control', () => {
+    it('POST /v1/sessions registers active OpenCode session from desktop', async () => {
+      const res = await app.request('/v1/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: 'sess_opencode_test_01',
+          deviceId: 'dev_win_desktop_01',
+          title: 'Refactor Auth Session',
+          agentName: 'OpenCode Build Agent',
+          model: 'claude-3-7-sonnet',
+          projectPath: 'C:\\Projects\\BambooKit',
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.data.id).toBe('sess_opencode_test_01');
+      expect(json.data.agentName).toBe('OpenCode Build Agent');
+    });
+
+    it('POST /v1/sessions/:id/message queues remote directive for Windows workstation', async () => {
+      const res = await app.request('/v1/sessions/sess_opencode_test_01/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: 'Fix failing unit tests in API authentication',
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.data.status).toBe('DISPATCHED_TO_DESKTOP');
+      expect(json.data.sessionId).toBe('sess_opencode_test_01');
+    });
+
+    it('GET /v1/devices/:id/commands returns queued directive to desktop', async () => {
+      const res = await app.request('/v1/devices/dev_win_desktop_01/commands');
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.data.length).toBeGreaterThanOrEqual(1);
+      expect(json.data[0].type).toBe('SEND_MESSAGE');
+    });
+  });
 });
