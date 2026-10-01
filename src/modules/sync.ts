@@ -1,0 +1,234 @@
+import { Hono } from 'hono';
+import { z } from 'zod';
+import { db, now, tx } from '../db/database.js';
+import { requireDevice, requireUser, type AppEnv } from '../middleware/auth.js';
+import { stableId } from '../lib/http.js';
+import { publish } from '../realtime/bus.js';
+import { notify } from './notifications.js';
+import { serializeApproval, serializePart, serializeProject, serializeSession } from './serializers.js';
+
+/**
+ * Desktop → API state sync. The desktop is the authority for OpenCode state; it pushes the
+ * minimum metadata needed for remote monitoring. Source code is never sent here except
+ * assistant/user message text that the user sees in the chat transcript.
+ */
+export const syncRouter = new Hono<AppEnv>();
+syncRouter.use('*', requireUser, requireDevice('desktop'));
+
+const MAX_TEXT = 20_000;
+const status = z.enum(['idle', 'busy', 'retry', 'error']);
+
+const syncSchema = z.object({
+  projects: z
+    .array(z.object({ opencodeProjectId: z.string().min(1), name: z.string().min(1).max(200), directory: z.string().min(1).max(1000), branch: z.string().max(200).nullish() }))
+    .max(200)
+    .optional(),
+  sessions: z
+    .array(
+      z.object({
+        opencodeSessionId: z.string().min(1).max(200),
+        opencodeProjectId: z.string().max(200).nullish(),
+        parentId: z.string().max(200).nullish(),
+        directory: z.string().min(1).max(1000),
+        title: z.string().max(500),
+        status,
+        statusMessage: z.string().max(1000).nullish(),
+        agent: z.string().max(100).nullish(),
+        model: z.string().max(200).nullish(),
+        additions: z.number().int().nonnegative().default(0),
+        deletions: z.number().int().nonnegative().default(0),
+        files: z.number().int().nonnegative().default(0),
+        currentAction: z.string().max(500).nullish(),
+        createdAt: z.string().optional(),
+      }),
+    )
+    .max(500)
+    .optional(),
+  removedSessions: z.array(z.string().max(200)).max(500).optional(),
+  parts: z
+    .array(
+      z.object({
+        opencodeSessionId: z.string().max(200),
+        messageId: z.string().max(200),
+        partId: z.string().max(200),
+        role: z.enum(['user', 'assistant']),
+        type: z.enum(['text', 'reasoning', 'tool']),
+        text: z.string().nullish(),
+        tool: z.string().max(100).nullish(),
+        toolStatus: z.string().max(40).nullish(),
+        toolTitle: z.string().max(500).nullish(),
+        sortKey: z.string().max(100),
+      }),
+    )
+    .max(500)
+    .optional(),
+  diffs: z
+    .array(
+      z.object({
+        opencodeSessionId: z.string().max(200),
+        files: z
+          .array(z.object({ file: z.string().max(1000), status: z.string().max(20).nullish(), additions: z.number().int().nonnegative(), deletions: z.number().int().nonnegative() }))
+          .max(2000),
+      }),
+    )
+    .max(100)
+    .optional(),
+  approvals: z
+    .array(
+      z.object({
+        opencodeSessionId: z.string().max(200),
+        requestId: z.string().max(200),
+        permission: z.string().max(100),
+        title: z.string().max(1000).nullish(),
+        patterns: z.array(z.string().max(1000)).max(50).default([]),
+        status: z.enum(['PENDING', 'APPROVED', 'REJECTED']),
+        reply: z.string().max(20).nullish(),
+      }),
+    )
+    .max(200)
+    .optional(),
+  // Complete list of request ids still pending on the desktop; anything else pending is expired.
+  pendingApprovalSnapshot: z.array(z.string().max(200)).max(500).optional(),
+  activity: z
+    .array(z.object({ opencodeSessionId: z.string().max(200).nullish(), type: z.string().max(60), summary: z.string().max(1000), data: z.record(z.unknown()).optional() }))
+    .max(200)
+    .optional(),
+});
+
+export type SyncPayload = z.infer<typeof syncSchema>;
+
+syncRouter.post('/', async (c) => {
+  const user = c.get('user');
+  const device = c.get('device')!;
+  const body = syncSchema.parse(JSON.parse(await c.req.text()));
+  const ts = now();
+  const out: Array<Parameters<typeof publish>[0]> = [];
+  const notes: Array<Parameters<typeof notify>[0]> = [];
+  const projectIds = new Map<string, string>();
+  const sessionIdFor = (ocId: string) => stableId('ses', device.id, ocId);
+
+  tx(() => {
+    for (const p of body.projects ?? []) {
+      const id = stableId('prj', device.id, p.opencodeProjectId);
+      projectIds.set(p.opencodeProjectId, id);
+      db.prepare(`
+        INSERT INTO projects (id, user_id, device_id, opencode_project_id, name, directory, branch, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET name = excluded.name, directory = excluded.directory, branch = excluded.branch, updated_at = excluded.updated_at
+      `).run(id, user.id, device.id, p.opencodeProjectId, p.name, p.directory, p.branch ?? null, ts, ts);
+      out.push({ userId: user.id, deviceId: device.id, projectId: id, type: 'project.updated', payload: serializeProject(db.prepare('SELECT * FROM projects WHERE id = ?').get(id)) });
+    }
+
+    for (const s of body.sessions ?? []) {
+      const id = sessionIdFor(s.opencodeSessionId);
+      const projectId = s.opencodeProjectId ? projectIds.get(s.opencodeProjectId) ?? stableId('prj', device.id, s.opencodeProjectId) : null;
+      const projectExists = projectId && db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId);
+      const previous = db.prepare('SELECT status, title FROM sessions WHERE id = ?').get(id) as any;
+      db.prepare(`
+        INSERT INTO sessions (id, user_id, device_id, project_id, opencode_session_id, parent_opencode_session_id, directory, title, status,
+          status_message, agent, model, additions, deletions, files, current_action, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET project_id = COALESCE(excluded.project_id, sessions.project_id), directory = excluded.directory,
+          title = excluded.title, status = excluded.status, status_message = excluded.status_message,
+          agent = COALESCE(excluded.agent, sessions.agent), model = COALESCE(excluded.model, sessions.model),
+          additions = excluded.additions, deletions = excluded.deletions, files = excluded.files,
+          current_action = excluded.current_action, updated_at = excluded.updated_at
+      `).run(
+        id, user.id, device.id, projectExists ? projectId : null, s.opencodeSessionId, s.parentId ?? null, s.directory, s.title || 'Untitled session',
+        s.status, s.statusMessage ?? null, s.agent ?? null, s.model ?? null, s.additions, s.deletions, s.files, s.currentAction ?? null, s.createdAt ?? ts, ts,
+      );
+      const row = db.prepare('SELECT s.*, p.name AS project_name FROM sessions s LEFT JOIN projects p ON p.id = s.project_id WHERE s.id = ?').get(id);
+      out.push({ userId: user.id, deviceId: device.id, projectId: (row as any).project_id, sessionId: id, type: 'session.updated', payload: serializeSession(row) });
+
+      // Notifications only on real state transitions reported by OpenCode.
+      if (previous && previous.status !== s.status && !s.parentId) {
+        const title = s.title || 'Session';
+        if ((previous.status === 'busy' || previous.status === 'retry') && s.status === 'idle') {
+          notes.push({ userId: user.id, type: 'session.completed', title: 'Agent finished', body: title, data: { sessionId: id } });
+        } else if (s.status === 'error') {
+          notes.push({ userId: user.id, type: 'session.failed', title: 'Agent failed', body: title, data: { sessionId: id } });
+        }
+      }
+    }
+
+    for (const ocId of body.removedSessions ?? []) {
+      const id = sessionIdFor(ocId);
+      if (!db.prepare('SELECT 1 FROM sessions WHERE id = ? AND user_id = ?').get(id, user.id)) continue;
+      db.prepare('DELETE FROM session_parts WHERE session_id = ?').run(id);
+      db.prepare('DELETE FROM session_diffs WHERE session_id = ?').run(id);
+      db.prepare('DELETE FROM approvals WHERE session_id = ?').run(id);
+      db.prepare('UPDATE commands SET session_id = NULL WHERE session_id = ?').run(id);
+      const res = db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+      if (res.changes) out.push({ userId: user.id, deviceId: device.id, sessionId: id, type: 'session.removed', payload: { id } });
+    }
+
+    for (const p of body.parts ?? []) {
+      const sessionId = sessionIdFor(p.opencodeSessionId);
+      if (!db.prepare('SELECT 1 FROM sessions WHERE id = ? AND user_id = ?').get(sessionId, user.id)) continue;
+      const id = stableId('prt', sessionId, p.partId);
+      db.prepare(`
+        INSERT INTO session_parts (id, session_id, message_id, role, type, text, tool, tool_status, tool_title, sort_key, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET text = excluded.text, tool_status = excluded.tool_status, tool_title = excluded.tool_title, updated_at = excluded.updated_at
+      `).run(id, sessionId, p.messageId, p.role, p.type, p.text?.slice(0, MAX_TEXT) ?? null, p.tool ?? null, p.toolStatus ?? null, p.toolTitle ?? null, p.sortKey, ts);
+      out.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.part', payload: serializePart(db.prepare('SELECT * FROM session_parts WHERE id = ?').get(id)) });
+    }
+
+    for (const d of body.diffs ?? []) {
+      const sessionId = sessionIdFor(d.opencodeSessionId);
+      if (!db.prepare('SELECT 1 FROM sessions WHERE id = ? AND user_id = ?').get(sessionId, user.id)) continue;
+      db.prepare('DELETE FROM session_diffs WHERE session_id = ?').run(sessionId);
+      const ins = db.prepare('INSERT INTO session_diffs (session_id, file, status, additions, deletions, updated_at) VALUES (?, ?, ?, ?, ?, ?)');
+      for (const f of d.files) ins.run(sessionId, f.file, f.status ?? null, f.additions, f.deletions, ts);
+      out.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.diff', payload: { sessionId, files: d.files } });
+    }
+
+    for (const a of body.approvals ?? []) {
+      const sessionId = sessionIdFor(a.opencodeSessionId);
+      if (!db.prepare('SELECT 1 FROM sessions WHERE id = ? AND user_id = ?').get(sessionId, user.id)) continue;
+      const id = stableId('apr', device.id, a.requestId);
+      const existing = db.prepare('SELECT status FROM approvals WHERE id = ?').get(id) as any;
+      if (!existing) {
+        db.prepare(`
+          INSERT INTO approvals (id, user_id, device_id, session_id, opencode_request_id, permission, title, patterns, status, reply, created_at, resolved_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, user.id, device.id, sessionId, a.requestId, a.permission, a.title ?? null, JSON.stringify(a.patterns), a.status, a.reply ?? null, ts, a.status === 'PENDING' ? null : ts);
+        if (a.status === 'PENDING') {
+          notes.push({ userId: user.id, type: 'approval.required', title: 'Approval required', body: `${a.permission}${a.title ? `: ${a.title.slice(0, 120)}` : ''}`, data: { approvalId: id, sessionId } });
+        }
+      } else if (a.status !== 'PENDING') {
+        db.prepare('UPDATE approvals SET status = ?, reply = ?, resolved_at = ? WHERE id = ?').run(a.status, a.reply ?? null, ts, id);
+      } else {
+        continue;
+      }
+      const row = approvalRow(id);
+      out.push({ userId: user.id, deviceId: device.id, sessionId, type: existing ? 'approval.updated' : 'approval.created', payload: serializeApproval(row) });
+    }
+
+    if (body.pendingApprovalSnapshot) {
+      const keep = new Set(body.pendingApprovalSnapshot);
+      const pending = db.prepare("SELECT id, opencode_request_id, session_id FROM approvals WHERE device_id = ? AND status IN ('PENDING','RESPONDING')").all(device.id) as any[];
+      for (const p of pending) {
+        if (keep.has(p.opencode_request_id)) continue;
+        db.prepare("UPDATE approvals SET status = 'EXPIRED', resolved_at = ? WHERE id = ?").run(ts, p.id);
+        out.push({ userId: user.id, deviceId: device.id, sessionId: p.session_id, type: 'approval.updated', payload: serializeApproval(approvalRow(p.id)) });
+      }
+    }
+
+    for (const a of body.activity ?? []) {
+      const sessionId = a.opencodeSessionId ? sessionIdFor(a.opencodeSessionId) : null;
+      out.push({ userId: user.id, deviceId: device.id, sessionId, type: 'activity', payload: { kind: a.type, summary: a.summary, data: a.data ?? {} } });
+    }
+  });
+
+  for (const e of out) publish(e);
+  for (const n of notes) notify(n);
+  return c.json({ data: { accepted: true, events: out.length } });
+});
+
+function approvalRow(id: string) {
+  return db
+    .prepare(`SELECT a.*, s.title AS session_title, p.name AS project_name FROM approvals a
+      JOIN sessions s ON s.id = a.session_id LEFT JOIN projects p ON p.id = s.project_id WHERE a.id = ?`)
+    .get(id);
+}

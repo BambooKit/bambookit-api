@@ -1,82 +1,121 @@
-import { Context, MiddlewareHandler } from 'hono';
-import { verifyToken } from '../lib/crypto.js';
+import { createMiddleware } from 'hono/factory';
+import { verify as edVerify, createPublicKey } from 'node:crypto';
 import { env } from '../config/env.js';
-import { memoryDb } from '../db/memoryDb.js';
+import { verifySupabaseToken, type AuthUser } from '../auth/supabase.js';
+import { db, now } from '../db/database.js';
+import { forbidden, sha256, unauthorized } from '../lib/http.js';
 
-export interface AuthContext {
-  userId: string;
-  email: string;
+export interface DeviceRow {
+  id: string;
+  user_id: string;
+  kind: 'desktop' | 'mobile';
   name: string;
-  workspaceId: string;
-  role: 'OWNER' | 'ADMIN' | 'DEVELOPER' | 'VIEWER';
+  platform: string;
+  app_version: string | null;
+  public_key: string | null;
+  push_token: string | null;
+  last_seen_at: string | null;
+  created_at: string;
+  revoked_at: string | null;
 }
 
-declare module 'hono' {
-  interface ContextVariableMap {
-    auth: AuthContext;
+export type AppEnv = {
+  Variables: {
     requestId: string;
-  }
-}
-
-export const authMiddleware: MiddlewareHandler = async (c, next) => {
-  const authHeader = c.req.header('Authorization');
-
-  // 1. Bearer Token Authentication
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7);
-    const decoded = verifyToken<AuthContext>(token);
-
-    if (decoded && decoded.userId) {
-      c.set('auth', decoded);
-      return next();
-    }
-  }
-
-  // 2. Explicit Development Mode Bypass (Guarded by DEV_AUTH_ENABLED)
-  if (env.DEV_AUTH_ENABLED && env.NODE_ENV !== 'production') {
-    const devWorkspaceHeader = c.req.header('X-Workspace-Id');
-    c.set('auth', {
-      userId: memoryDb.data.user.id,
-      email: memoryDb.data.user.email,
-      name: memoryDb.data.user.name,
-      workspaceId: devWorkspaceHeader || memoryDb.data.workspace.id,
-      role: 'OWNER',
-    });
-    return next();
-  }
-
-  return c.json(
-    {
-      error: {
-        code: 'UNAUTHORIZED',
-        message: 'Missing or invalid authentication token. Provide Authorization: Bearer <token>',
-      },
-      requestId: c.get('requestId') || 'unknown',
-    },
-    401
-  );
+    user: AuthUser;
+    device: DeviceRow | null;
+  };
 };
 
-export function requireRole(...allowedRoles: Array<'OWNER' | 'ADMIN' | 'DEVELOPER' | 'VIEWER'>): MiddlewareHandler {
-  return async (c, next) => {
-    const auth = c.get('auth');
-    if (!auth) {
-      return c.json({ error: { code: 'UNAUTHORIZED', message: 'Authentication required' } }, 401);
+const upsertUser = db.prepare(`
+  INSERT INTO users (id, email, name, avatar_url, created_at, last_seen_at)
+  VALUES (?, ?, ?, ?, ?, ?)
+  ON CONFLICT(id) DO UPDATE SET
+    email = excluded.email,
+    name = COALESCE(excluded.name, users.name),
+    avatar_url = COALESCE(excluded.avatar_url, users.avatar_url),
+    last_seen_at = excluded.last_seen_at
+`);
+
+const lastUpsert = new Map<string, number>();
+
+/** Requires a valid Supabase access token. Mirrors the user into the local users table. */
+export const requireUser = createMiddleware<AppEnv>(async (c, next) => {
+  const header = c.req.header('Authorization');
+  const queryToken = c.req.query('access_token'); // only for clients that cannot set headers on SSE
+  const token = header?.startsWith('Bearer ') ? header.slice(7) : queryToken;
+  if (!token) throw unauthorized();
+
+  const user = await verifySupabaseToken(token);
+  const last = lastUpsert.get(user.id) ?? 0;
+  if (Date.now() - last > 30_000) {
+    const ts = now();
+    upsertUser.run(user.id, user.email, user.name, user.avatarUrl, ts, ts);
+    lastUpsert.set(user.id, Date.now());
+  }
+  c.set('user', user);
+  c.set('device', null);
+  await next();
+});
+
+const getDevice = db.prepare('SELECT * FROM devices WHERE id = ?');
+const touchDevice = db.prepare('UPDATE devices SET last_seen_at = ? WHERE id = ?');
+
+/** Builds the canonical string a device signs. Shared with clients (see bambookit-sdk). */
+export function signingPayload(method: string, pathWithQuery: string, timestamp: string, body: string): string {
+  return `${method.toUpperCase()}\n${pathWithQuery}\n${timestamp}\n${sha256(body)}`;
+}
+
+export function verifyDeviceSignature(publicKeyPem: string, payload: string, signatureB64: string): boolean {
+  try {
+    return edVerify(null, Buffer.from(payload), createPublicKey(publicKeyPem), Buffer.from(signatureB64, 'base64'));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolves the calling device from X-BK-Device-Id and checks the user owns it.
+ * Desktop devices must additionally sign every request with their Ed25519 key.
+ * Use after requireUser.
+ */
+export function requireDevice(kind?: 'desktop' | 'mobile') {
+  return createMiddleware<AppEnv>(async (c, next) => {
+    const user = c.get('user');
+    const deviceId = c.req.header('X-BK-Device-Id');
+    if (!deviceId) throw unauthorized('Device identification required', 'DEVICE_REQUIRED');
+
+    const device = getDevice.get(deviceId) as DeviceRow | undefined;
+    if (!device || device.user_id !== user.id) throw forbidden('Device not registered to this account', 'DEVICE_NOT_OWNED');
+    if (device.revoked_at) throw forbidden('Device has been revoked', 'DEVICE_REVOKED');
+    if (kind && device.kind !== kind) throw forbidden(`This operation requires a ${kind} device`, 'WRONG_DEVICE_KIND');
+
+    if (device.kind === 'desktop') {
+      if (!device.public_key) throw forbidden('Device has no public key', 'DEVICE_KEY_MISSING');
+      await requireSignature(c, device.public_key);
     }
 
-    if (!allowedRoles.includes(auth.role)) {
-      return c.json(
-        {
-          error: {
-            code: 'FORBIDDEN',
-            message: `Insufficient permissions. Required one of: ${allowedRoles.join(', ')}`,
-          },
-          requestId: c.get('requestId'),
-        },
-        403
-      );
-    }
+    touchDevice.run(now(), device.id);
+    c.set('device', device);
+    await next();
+  });
+}
 
-    return next();
-  };
+/** Verifies X-BK-Timestamp / X-BK-Signature against the given public key. */
+export async function requireSignature(c: any, publicKeyPem: string): Promise<void> {
+  const timestamp = c.req.header('X-BK-Timestamp');
+  const signature = c.req.header('X-BK-Signature');
+  if (!timestamp || !signature) throw unauthorized('Device signature required', 'SIGNATURE_REQUIRED');
+
+  const skew = Math.abs(Date.now() - Number(timestamp));
+  if (!Number.isFinite(skew) || skew > env.DEVICE_SIGNATURE_MAX_SKEW_SECONDS * 1000) {
+    throw unauthorized('Device signature timestamp out of range', 'SIGNATURE_EXPIRED');
+  }
+
+  const url = new URL(c.req.url);
+  const body = ['GET', 'HEAD'].includes(c.req.method) ? '' : await c.req.text();
+  const payload = signingPayload(c.req.method, url.pathname + url.search, timestamp, body);
+  if (!verifyDeviceSignature(publicKeyPem, payload, signature)) {
+    throw unauthorized('Invalid device signature', 'SIGNATURE_INVALID');
+  }
 }
