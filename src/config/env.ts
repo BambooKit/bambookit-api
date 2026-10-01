@@ -17,6 +17,9 @@ const envSchema = z.object({
   SUPABASE_URL: z.string().url(),
   SUPABASE_ANON_KEY: z.string().optional(),
   SUPABASE_JWT_SECRET: z.string().optional(),
+  // Firebase project used as the Google identity provider (Supabase third-party auth).
+  // Firebase ID tokens are verified against Google's public keys; no secret is required.
+  FIREBASE_PROJECT_ID: z.string().optional(),
 
   PAIRING_TOKEN_TTL_SECONDS: z.coerce.number().default(120),
   // Max allowed clock skew for device request signatures.

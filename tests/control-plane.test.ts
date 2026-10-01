@@ -7,6 +7,7 @@ process.env.DATABASE_PATH = ':memory:';
 process.env.SUPABASE_URL = 'https://test-project.supabase.co';
 process.env.SUPABASE_JWT_SECRET = 'test-jwt-secret-for-unit-tests-only-0123456789';
 process.env.LOG_LEVEL = 'error';
+process.env.FIREBASE_PROJECT_ID = 'test-firebase-project';
 
 let app: typeof import('../src/app.js').app;
 let db: typeof import('../src/db/database.js').db;
@@ -81,6 +82,18 @@ describe('authentication', () => {
     const bad = await new SignJWT({}).setProtectedHeader({ alg: 'HS256' }).setSubject('x').setIssuer('https://test-project.supabase.co/auth/v1')
       .setAudience('authenticated').setExpirationTime('1h').sign(new TextEncoder().encode('wrong-secret-wrong-secret-wrong'));
     expect((await call('GET', '/v1/me', { token: bad })).status).toBe(401);
+  });
+
+  it('rejects forged tokens that claim the Firebase issuer', async () => {
+    const forged = await new SignJWT({ email: 'x@example.com', email_verified: true })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject('firebase-uid')
+      .setIssuer('https://securetoken.google.com/test-firebase-project')
+      .setAudience('test-firebase-project')
+      .setExpirationTime('1h')
+      .sign(new TextEncoder().encode(process.env.SUPABASE_JWT_SECRET));
+    const res = await call('GET', '/v1/me', { token: forged });
+    expect(res.status).toBe(401);
   });
 
   it('returns the Supabase user for a valid token', async () => {

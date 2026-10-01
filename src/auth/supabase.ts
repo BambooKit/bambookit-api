@@ -50,13 +50,52 @@ async function verifyViaAuthServer(token: string): Promise<AuthUser> {
   return user;
 }
 
-/** Verify a Supabase access token and return the authenticated user. */
+const FIREBASE_JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
+let firebaseJwks: ReturnType<typeof createRemoteJWKSet> | null = null;
+
+/** Verify a Firebase ID token (Google sign-in) for the configured Firebase project. */
+async function verifyFirebaseToken(token: string): Promise<AuthUser> {
+  const projectId = env.FIREBASE_PROJECT_ID!;
+  firebaseJwks ??= createRemoteJWKSet(new URL(FIREBASE_JWKS_URL));
+  try {
+    const { payload } = await jwtVerify(token, firebaseJwks, {
+      issuer: `https://securetoken.google.com/${projectId}`,
+      audience: projectId,
+      algorithms: ['RS256'],
+    });
+    const p = payload as JWTPayload & Record<string, any>;
+    if (p.email && p.email_verified === false) throw unauthorized('Email address is not verified', 'EMAIL_NOT_VERIFIED');
+    return fromClaims({ ...p, user_metadata: { full_name: p.name, avatar_url: p.picture } });
+  } catch (err: any) {
+    if (err?.status === 401) throw err;
+    throw unauthorized(err?.code === 'ERR_JWT_EXPIRED' ? 'Session expired' : 'Invalid session token', 'INVALID_TOKEN');
+  }
+}
+
+function tokenIssuer(token: string): string | undefined {
+  try {
+    const body = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8'));
+    return typeof body.iss === 'string' ? body.iss : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Verify an access token and return the authenticated user. Accepts Supabase Auth sessions and,
+ * when FIREBASE_PROJECT_ID is set, Firebase ID tokens (Firebase as Supabase third-party auth).
+ * The issuer only selects the verification path; the signature and claims are always checked.
+ */
 export async function verifySupabaseToken(token: string): Promise<AuthUser> {
   let alg: string | undefined;
   try {
     alg = decodeProtectedHeader(token).alg;
   } catch {
     throw unauthorized('Malformed token', 'INVALID_TOKEN');
+  }
+
+  if (env.FIREBASE_PROJECT_ID && tokenIssuer(token) === `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`) {
+    return verifyFirebaseToken(token);
   }
 
   try {
