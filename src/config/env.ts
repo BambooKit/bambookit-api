@@ -21,6 +21,8 @@ const envSchema = z.object({
   // Firebase ID tokens are verified against Google's public keys; no secret is required.
   FIREBASE_PROJECT_ID: z.string().optional(),
 
+  // Public origin used in share links (e.g. https://bambookit-web.onrender.com). Defaults to this API's origin.
+  PUBLIC_SHARE_BASE_URL: z.string().url().optional(),
   PAIRING_TOKEN_TTL_SECONDS: z.coerce.number().default(120),
   // Max allowed clock skew for device request signatures.
   DEVICE_SIGNATURE_MAX_SKEW_SECONDS: z.coerce.number().default(300),

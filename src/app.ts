@@ -15,6 +15,7 @@ import { approvalsRouter } from './modules/approvals.js';
 import { notificationsRouter } from './modules/notifications.js';
 import { syncRouter } from './modules/sync.js';
 import { realtimeRouter } from './modules/realtime.js';
+import { sharesRouter } from './modules/shares.js';
 
 export const app = new Hono<AppEnv>();
 
@@ -58,4 +59,6 @@ v1.route('/sync', syncRouter);
 v1.route('/realtime', realtimeRouter);
 
 app.route('/v1', v1);
+// Public session sharing (OpenCode share protocol + viewer). No user auth: secrets authorize writes.
+app.route('/', sharesRouter);
 app.notFound((c) => c.json({ error: { code: 'NOT_FOUND', message: 'Route not found' } }, 404));

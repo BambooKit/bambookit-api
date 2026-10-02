@@ -284,3 +284,42 @@ describe('realtime', () => {
     expect([...ids].sort((a, b) => a - b)).toEqual(ids);
   });
 });
+
+describe('session sharing', () => {
+  it('implements the share protocol and protects writes with the share secret', async () => {
+    const created = await call('POST', '/api/share', { body: { sessionID: 'ses_share_1' } });
+    expect(created.status).toBe(200);
+    const { id, secret, url } = created.json;
+    expect(url).toBe(`http://localhost/share/${id}`);
+    expect(secret.length).toBeGreaterThan(30);
+
+    const items = [
+      { type: 'session', data: { id: 'ses_share_1', title: 'Fix <b>auth</b>' } },
+      { type: 'message', data: { id: 'msg_1', role: 'user', time: { created: 1 } } },
+      { type: 'part', data: { id: 'prt_1', messageID: 'msg_1', type: 'text', text: 'hello <script>alert(1)</script>' } },
+      { type: 'session_diff', data: [{ file: 'src/a.ts', additions: 2, deletions: 1 }] },
+    ];
+    expect((await call('POST', `/api/share/${id}/sync`, { body: { secret, data: items } })).status).toBe(200);
+    // Updating a part replaces it instead of duplicating it.
+    await call('POST', `/api/share/${id}/sync`, { body: { secret, data: [{ type: 'part', data: { id: 'prt_1', messageID: 'msg_1', type: 'text', text: 'hello again' } }] } });
+    expect((await call('POST', `/api/share/${id}/sync`, { body: { secret: 'wrong', data: items } })).status).toBe(403);
+
+    const data = await call('GET', `/api/share/${id}/data`);
+    expect(data.json.filter((i: any) => i.type === 'part')).toHaveLength(1);
+    expect(data.json.find((i: any) => i.type === 'part').data.text).toBe('hello again');
+
+    await call('POST', `/api/share/${id}/sync`, { body: { secret, data: [{ type: 'part', data: { id: 'prt_2', messageID: 'msg_1', type: 'text', text: '<script>alert(1)</script>' } }] } });
+    const page = await app.request(`http://localhost/share/${id}`);
+    const html = await page.text();
+    expect(page.status).toBe(200);
+    expect(page.headers.get('content-security-policy')).toContain("default-src 'none'");
+    expect(html).toContain('Fix &lt;b&gt;auth&lt;/b&gt;');
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('src/a.ts');
+
+    expect((await call('DELETE', `/api/share/${id}`, { body: { secret: 'wrong' } })).status).toBe(403);
+    expect((await call('DELETE', `/api/share/${id}`, { body: { secret } })).status).toBe(200);
+    expect((await call('GET', `/api/share/${id}/data`)).status).toBe(404);
+  });
+});
