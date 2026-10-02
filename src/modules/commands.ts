@@ -18,6 +18,15 @@ export const commandPayloads = {
   REFRESH: z.object({}).strict(),
   PERMISSION_REPLY: z.object({ requestId: z.string(), reply: z.enum(['once', 'always', 'reject']) }),
   CREATE_SESSION: z.object({ directory: z.string().min(1).max(1000), text: z.string().min(1).max(20_000) }),
+  // Rewind the conversation (and, where the engine has snapshots, the files) to before a message.
+  REVERT: z.object({ messageId: z.string().min(1).max(200) }),
+  UNREVERT: z.object({}).strict(),
+  // Publish / unpublish the session through the BambooKit share service.
+  SHARE: z.object({}).strict(),
+  UNSHARE: z.object({}).strict(),
+  // Read or edit a file inside the session's project folder (the desktop enforces the folder boundary).
+  READ_FILE: z.object({ path: z.string().min(1).max(1000) }),
+  WRITE_FILE: z.object({ path: z.string().min(1).max(1000), content: z.string().max(1_000_000), baseSha256: z.string().max(64).nullable() }),
 } as const;
 
 export type CommandType = keyof typeof commandPayloads;

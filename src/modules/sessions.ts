@@ -88,7 +88,10 @@ sessionsRouter.get('/:id/changes', async (c) => {
 });
 
 // POST /v1/sessions/:id/commands { type, payload }
-const userCommandTypes = ['SEND_MESSAGE', 'ABORT', 'CONTINUE', 'RETRY', 'GET_DIFF', 'REFRESH'] as const;
+const userCommandTypes = [
+  'SEND_MESSAGE', 'ABORT', 'CONTINUE', 'RETRY', 'GET_DIFF', 'REFRESH',
+  'REVERT', 'UNREVERT', 'SHARE', 'UNSHARE', 'READ_FILE', 'WRITE_FILE',
+] as const;
 sessionsRouter.post('/:id/commands', async (c) => {
   const user = c.get('user');
   const session = await ownedSession(user.id, c.req.param('id'));

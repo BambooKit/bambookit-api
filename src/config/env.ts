@@ -48,7 +48,5 @@ function parseEnv(): Env {
 
 export const env = parseEnv();
 
-// On Render, share links point at the public website unless configured otherwise.
-if (!env.PUBLIC_SHARE_BASE_URL && env.RENDER) env.PUBLIC_SHARE_BASE_URL = 'https://bambookit-web.onrender.com';
 
 export const VERSION = '0.2.0';
