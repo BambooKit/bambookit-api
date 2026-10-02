@@ -134,7 +134,7 @@ architectureRouter.get('/', async (c) => {
     id: 'sessions', kind: 'sessions', label: 'Sessions', layer: 4,
     status: active.length ? 'active' : totalSessions ? 'idle' : 'unknown',
     detail: active.length ? `${active.length} working: ${active.map((s: any) => s.title).slice(0, 3).join(', ')}` : `${totalSessions} session${totalSessions === 1 ? '' : 's'}, none working`,
-    metrics: { active: active.length, total: totalSessions },
+    metrics: { active: active.length, total: totalSessions, opencodeSessionId: session?.opencode_session_id ?? null, directory: session?.directory ?? null },
     link: session ? { type: 'session', id: session.id } : undefined,
   });
   edge('engine', 'sessions', focusOnline && active.length > 0, focusOnline);
@@ -148,7 +148,7 @@ architectureRouter.get('/', async (c) => {
   nodes.push({
     id: 'agent', kind: 'agent', label: session.agent ? `Agent · ${session.agent}` : 'Agent', layer: 5, status: sessionStatus,
     detail: [session.title, session.model ? `model ${String(session.model).replace(/^opencode\//, 'BambooKit/')}` : null, session.current_action ?? (working ? 'Working' : 'Idle'), session.status_message].filter(Boolean).join(' · '),
-    metrics: { sessionId: session.id, status: session.status, model: session.model, currentAction: session.current_action },
+    metrics: { sessionId: session.id, opencodeSessionId: session.opencode_session_id, directory: session.directory, status: session.status, model: session.model, currentAction: session.current_action },
     link: { type: 'session', id: session.id },
   });
   edge('sessions', 'agent', working);
