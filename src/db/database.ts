@@ -277,7 +277,8 @@ function pgQueryable(client: PgLike): Queryable {
 async function openPostgres(url: string): Promise<Database> {
   // In-process Postgres (WASM) for tests: POSTGRES_URL=pglite://memory
   if (url.startsWith('pglite://')) {
-    const { PGlite } = await import('@electric-sql/pglite');
+    // Test-only dependency; resolved at runtime so production builds do not need it installed.
+    const { PGlite } = (await import('@electric-sql/pglite' as string)) as any;
     const lite = new PGlite();
     const client: PgLike = { query: async (sql, params) => lite.query(sql, params as any[]) as any };
     for (const s of statements('postgres')) await lite.exec(s);
@@ -290,7 +291,7 @@ async function openPostgres(url: string): Promise<Database> {
         await lite.query('SELECT 1');
       },
       tx<T>(fn: (q: Queryable) => Promise<T>) {
-        const run = chain.then(() => lite.transaction(async (t) => fn(pgQueryable({ query: async (sql, params) => t.query(sql, params as any[]) as any }))));
+        const run = chain.then(() => lite.transaction(async (t: any) => fn(pgQueryable({ query: async (sql, params) => t.query(sql, params as any[]) as any }))));
         chain = run.catch(() => undefined);
         return run as Promise<T>;
       },
