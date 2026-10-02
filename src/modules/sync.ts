@@ -3,14 +3,15 @@ import { z } from 'zod';
 import { db, now } from '../db/database.js';
 import { requireDevice, requireUser, type AppEnv } from '../middleware/auth.js';
 import { stableId } from '../lib/http.js';
-import { publish } from '../realtime/bus.js';
+import { emitEphemeral, publish } from '../realtime/bus.js';
 import { notify } from './notifications.js';
-import { serializeApproval, serializePart, serializeProject, serializeSession } from './serializers.js';
+import { serializeApproval, serializeProject, serializeSession } from './serializers.js';
 
 /**
- * Desktop → API state sync. The desktop is the authority for OpenCode state; it pushes the
- * minimum metadata needed for remote monitoring. Source code is never sent here except
- * assistant/user message text that the user sees in the chat transcript.
+ * Desktop → API state sync. The PC is the only place session content is stored. The API keeps a
+ * small index (projects and sessions: names, titles, status, timestamps) plus approvals, so phones
+ * and the website can list sessions and answer approvals. Chat parts, diffs and activity are passed
+ * straight to connected clients as live-only events and are never written to the database.
  */
 export const syncRouter = new Hono<AppEnv>();
 syncRouter.use('*', requireUser, requireDevice('desktop'));
@@ -52,6 +53,8 @@ const syncSchema = z.object({
         deletions: z.number().int().nonnegative().default(0),
         files: z.number().int().nonnegative().default(0),
         currentAction: z.string().max(500).nullish(),
+        // True once the user has continued this session on the PC; only then may phones chat in it.
+        remote: z.boolean().default(false),
         createdAt: z.string().optional(),
       }),
     )
@@ -59,8 +62,8 @@ const syncSchema = z.object({
     .optional(),
   removedSessions: z.array(z.string().max(200)).max(500).optional(),
   parts: z.array(partSchema).max(500).optional(),
-  // Full transcript of a session, replacing what is stored (used after resync, rewind or deletions).
-  transcripts: z.array(z.object({ opencodeSessionId: z.string().max(200), parts: z.array(partSchema).max(2000) })).max(5).optional(),
+  // A session's transcript changed as a whole (rewind, deletions): clients refetch it from the PC.
+  transcriptsChanged: z.array(z.string().max(200)).max(50).optional(),
   diffs: z
     .array(
       z.object({
@@ -86,15 +89,6 @@ const syncSchema = z.object({
     )
     .max(200)
     .optional(),
-  // Local engine state reported by the desktop (for the live architecture map). Names and statuses only.
-  engine: z
-    .object({
-      version: z.string().max(40).nullish(),
-      mcp: z.array(z.object({ name: z.string().max(100), status: z.string().max(40) })).max(100).default([]),
-      providers: z.array(z.object({ id: z.string().max(100), name: z.string().max(100) })).max(200).default([]),
-      terminals: z.array(z.object({ id: z.string().max(100), title: z.string().max(200).nullish(), status: z.string().max(40).nullish() })).max(50).default([]),
-    })
-    .optional(),
   // Complete list of request ids still pending on the desktop; anything else pending is expired.
   pendingApprovalSnapshot: z.array(z.string().max(200)).max(500).optional(),
   activity: z
@@ -104,6 +98,24 @@ const syncSchema = z.object({
 });
 
 export type SyncPayload = z.infer<typeof syncSchema>;
+export type PartSync = z.infer<typeof partSchema>;
+
+/** Shape clients receive for a chat part (same for live events and transcripts fetched from the PC). */
+export function partView(sessionId: string, p: PartSync, ts: string) {
+  return {
+    id: stableId('prt', sessionId, p.partId),
+    sessionId,
+    messageId: p.messageId,
+    role: p.role,
+    type: p.type,
+    text: p.text?.slice(0, MAX_TEXT) ?? null,
+    tool: p.tool ?? null,
+    toolStatus: p.toolStatus ?? null,
+    toolTitle: p.toolTitle ?? null,
+    sortKey: p.sortKey,
+    updatedAt: ts,
+  };
+}
 
 syncRouter.post('/', async (c) => {
   const user = c.get('user');
@@ -111,6 +123,7 @@ syncRouter.post('/', async (c) => {
   const body = syncSchema.parse(JSON.parse(await c.req.text()));
   const ts = now();
   const out: Array<Parameters<typeof publish>[0]> = [];
+  const live: Array<Parameters<typeof emitEphemeral>[0]> = [];
   const notes: Array<Parameters<typeof notify>[0]> = [];
   const projectIds = new Map<string, string>();
   const sessionIdFor = (ocId: string) => stableId('ses', device.id, ocId);
@@ -140,15 +153,15 @@ syncRouter.post('/', async (c) => {
       const previous = await q.get('SELECT status, title FROM sessions WHERE id = ?', id);
       await q.run(
         `INSERT INTO sessions (id, user_id, device_id, project_id, opencode_session_id, parent_opencode_session_id, directory, title, status,
-           status_message, agent, model, additions, deletions, files, current_action, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           status_message, agent, model, additions, deletions, files, current_action, remote, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET project_id = COALESCE(excluded.project_id, sessions.project_id), directory = excluded.directory,
            title = excluded.title, status = excluded.status, status_message = excluded.status_message,
            agent = COALESCE(excluded.agent, sessions.agent), model = COALESCE(excluded.model, sessions.model),
            additions = excluded.additions, deletions = excluded.deletions, files = excluded.files,
-           current_action = excluded.current_action, updated_at = excluded.updated_at`,
+           current_action = excluded.current_action, remote = excluded.remote, updated_at = excluded.updated_at`,
         id, user.id, device.id, projectExists ? projectId : null, s.opencodeSessionId, s.parentId ?? null, s.directory, s.title || 'Untitled session',
-        s.status, s.statusMessage ?? null, s.agent ?? null, s.model ?? null, s.additions, s.deletions, s.files, s.currentAction ?? null, s.createdAt ?? ts, ts,
+        s.status, s.statusMessage ?? null, s.agent ?? null, s.model ?? null, s.additions, s.deletions, s.files, s.currentAction ?? null, s.remote ? 1 : 0, s.createdAt ?? ts, ts,
       );
       const row = await q.get('SELECT s.*, p.name AS project_name FROM sessions s LEFT JOIN projects p ON p.id = s.project_id WHERE s.id = ?', id);
       out.push({ userId: user.id, deviceId: device.id, projectId: row.project_id, sessionId: id, type: 'session.updated', payload: serializeSession(row) });
@@ -178,42 +191,19 @@ syncRouter.post('/', async (c) => {
     for (const p of body.parts ?? []) {
       const sessionId = sessionIdFor(p.opencodeSessionId);
       if (!(await ownsSession(sessionId))) continue;
-      const id = stableId('prt', sessionId, p.partId);
-      await q.run(
-        `INSERT INTO session_parts (id, session_id, message_id, role, type, text, tool, tool_status, tool_title, sort_key, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET text = excluded.text, tool_status = excluded.tool_status, tool_title = excluded.tool_title, updated_at = excluded.updated_at`,
-        id, sessionId, p.messageId, p.role, p.type, p.text?.slice(0, MAX_TEXT) ?? null, p.tool ?? null, p.toolStatus ?? null, p.toolTitle ?? null, p.sortKey, ts,
-      );
-      out.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.part', payload: serializePart(await q.get('SELECT * FROM session_parts WHERE id = ?', id)) });
+      live.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.part', payload: partView(sessionId, p, ts) });
     }
 
-    for (const t of body.transcripts ?? []) {
-      const sessionId = sessionIdFor(t.opencodeSessionId);
+    for (const ocId of body.transcriptsChanged ?? []) {
+      const sessionId = sessionIdFor(ocId);
       if (!(await ownsSession(sessionId))) continue;
-      await q.run('DELETE FROM session_parts WHERE session_id = ?', sessionId);
-      for (const p of t.parts) {
-        await q.run(
-          `INSERT INTO session_parts (id, session_id, message_id, role, type, text, tool, tool_status, tool_title, sort_key, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
-          stableId('prt', sessionId, p.partId), sessionId, p.messageId, p.role, p.type, p.text?.slice(0, MAX_TEXT) ?? null,
-          p.tool ?? null, p.toolStatus ?? null, p.toolTitle ?? null, p.sortKey, ts,
-        );
-      }
-      out.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.transcript', payload: { sessionId, parts: t.parts.length } });
+      live.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.transcript', payload: { sessionId } });
     }
 
     for (const d of body.diffs ?? []) {
       const sessionId = sessionIdFor(d.opencodeSessionId);
       if (!(await ownsSession(sessionId))) continue;
-      await q.run('DELETE FROM session_diffs WHERE session_id = ?', sessionId);
-      for (const f of d.files) {
-        await q.run(
-          'INSERT INTO session_diffs (session_id, file, status, additions, deletions, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, file) DO NOTHING',
-          sessionId, f.file, f.status ?? null, f.additions, f.deletions, ts,
-        );
-      }
-      out.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.diff', payload: { sessionId, files: d.files } });
+      live.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.diff', payload: { sessionId, files: d.files } });
     }
 
     for (const a of body.approvals ?? []) {
@@ -248,22 +238,14 @@ syncRouter.post('/', async (c) => {
       }
     }
 
-    if (body.engine) {
-      await q.run(
-        `INSERT INTO device_state (device_id, user_id, state, updated_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(device_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`,
-        device.id, user.id, JSON.stringify(body.engine), ts,
-      );
-      out.push({ userId: user.id, deviceId: device.id, type: 'engine.updated', payload: body.engine });
-    }
-
     for (const a of body.activity ?? []) {
       const sessionId = a.opencodeSessionId ? sessionIdFor(a.opencodeSessionId) : null;
-      out.push({ userId: user.id, deviceId: device.id, sessionId, type: 'activity', payload: { kind: a.type, summary: a.summary, data: a.data ?? {} } });
+      live.push({ userId: user.id, deviceId: device.id, sessionId, type: 'activity', payload: { kind: a.type, summary: a.summary, data: a.data ?? {} } });
     }
   });
 
   for (const e of out) await publish(e);
+  for (const e of live) emitEphemeral(e);
   for (const n of notes) await notify(n);
   return c.json({ data: { accepted: true, events: out.length } });
 });

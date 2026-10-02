@@ -8,6 +8,8 @@ import { commandRow, COMMAND_SELECT, serializeCommand } from './serializers.js';
 
 /** Commands older than this are never delivered — a stale remote action must not run hours later. */
 export const COMMAND_TTL_MS = 5 * 60_000;
+/** Finished command records (and their results) are deleted after this long. */
+export const COMMAND_RETENTION_MS = 15 * 60_000;
 
 export const commandPayloads = {
   SEND_MESSAGE: z.object({ text: z.string().min(1).max(20_000) }),
@@ -118,6 +120,10 @@ commandsRouter.post('/:id/result', requireDevice('desktop'), async (c) => {
   const result = body.result === undefined ? null : JSON.stringify(body.result);
   if (result && result.length > 2_000_000) throw new HttpError(422, 'RESULT_TOO_LARGE', 'Command result too large');
   await db.run('UPDATE commands SET status = ?, result = ?, error = ?, updated_at = ? WHERE id = ?', body.status, result, body.error ?? null, now(), row.id);
+  // Session content belongs on the PC: drop message text and file contents from finished commands,
+  // and delete command records (including results such as file reads) once they are no longer needed.
+  if (['SEND_MESSAGE', 'WRITE_FILE', 'CREATE_SESSION'].includes(row.type)) await db.run("UPDATE commands SET payload = '{}' WHERE id = ?", row.id);
+  await db.run('DELETE FROM commands WHERE created_at < ?', new Date(Date.now() - COMMAND_RETENTION_MS).toISOString());
 
   if (row.type === 'PERMISSION_REPLY' && body.status === 'FAILED') {
     // Let the user try again.

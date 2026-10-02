@@ -2,9 +2,11 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/database.js';
 import { requireUser, type AppEnv, type DeviceRow } from '../middleware/auth.js';
-import { badRequest, notFound } from '../lib/http.js';
+import { HttpError, badRequest, forbidden, notFound } from '../lib/http.js';
 import { commandPayloads, createCommand, resolveIssuer, type CommandType } from './commands.js';
-import { serializePart, serializeProject, serializeSession } from './serializers.js';
+import { serializeProject, serializeSession } from './serializers.js';
+import { relay } from './relay.js';
+import { partView, type PartSync } from './sync.js';
 
 const SESSION_SELECT = `
   SELECT s.*, p.name AS project_name,
@@ -40,15 +42,9 @@ projectsRouter.get('/:id', async (c) => {
   return c.json({ data: serializeProject(row) });
 });
 
-// POST /v1/projects/:id/sessions { text } — start a new session on the project's desktop
-projectsRouter.post('/:id/sessions', async (c) => {
-  const user = c.get('user');
-  const project = await db.get('SELECT * FROM projects WHERE id = ? AND user_id = ?', c.req.param('id'), user.id);
-  if (!project) throw notFound('Project');
-  const { text } = z.object({ text: z.string().min(1).max(20_000) }).parse(await c.req.json());
-  const issuer = await resolveIssuer(user.id, c.req.header('X-BK-Device-Id'));
-  const res = await createCommand({ userId: user.id, desktop: await desktopFor(project.device_id), sessionId: null, issuer, type: 'CREATE_SESSION', payload: { directory: project.directory, text } });
-  return c.json({ data: res.command, deviceOnline: res.deviceOnline }, 202);
+// New sessions are started on the PC; phones and the website continue sessions the PC has opened.
+projectsRouter.post('/:id/sessions', () => {
+  throw forbidden('Start new sessions in BambooKit Desktop on your PC, then continue them from your phone.', 'START_ON_PC');
 });
 
 // ---------------- Sessions ----------------
@@ -73,18 +69,27 @@ sessionsRouter.get('/:id', async (c) => {
   return c.json({ data: serializeSession(await ownedSession(c.get('user').id, c.req.param('id'))) });
 });
 
-// GET /v1/sessions/:id/parts — chat transcript (text, reasoning and tool parts)
+async function sessionDesktop(session: any) {
+  const desktop = await desktopFor(session.device_id);
+  if (!desktop || desktop.revoked_at) throw notFound('Device');
+  return desktop;
+}
+
+// GET /v1/sessions/:id/parts — chat transcript, read live from the PC (never stored by the API)
 sessionsRouter.get('/:id/parts', async (c) => {
-  const session = await ownedSession(c.get('user').id, c.req.param('id'));
-  const rows = await db.all('SELECT * FROM session_parts WHERE session_id = ? ORDER BY sort_key ASC LIMIT 2000', session.id);
-  return c.json({ data: rows.map(serializePart) });
+  const user = c.get('user');
+  const session = await ownedSession(user.id, c.req.param('id'));
+  const res = (await relay(user.id, await sessionDesktop(session), 'transcript', { opencodeSessionId: session.opencode_session_id })) as { parts?: PartSync[] } | null;
+  const ts = new Date().toISOString();
+  return c.json({ data: (res?.parts ?? []).slice(-2000).map((p) => partView(session.id, p, ts)) });
 });
 
-// GET /v1/sessions/:id/changes — changed files summary (patches are fetched with a GET_DIFF command)
+// GET /v1/sessions/:id/changes — changed files summary, read live from the PC (patches: GET_DIFF command)
 sessionsRouter.get('/:id/changes', async (c) => {
-  const session = await ownedSession(c.get('user').id, c.req.param('id'));
-  const rows = await db.all('SELECT file, status, additions, deletions, updated_at FROM session_diffs WHERE session_id = ? ORDER BY file', session.id);
-  return c.json({ data: rows.map((r) => ({ ...r, additions: Number(r.additions), deletions: Number(r.deletions) })) });
+  const user = c.get('user');
+  const session = await ownedSession(user.id, c.req.param('id'));
+  const res = (await relay(user.id, await sessionDesktop(session), 'changes', { opencodeSessionId: session.opencode_session_id })) as { files?: unknown[] } | null;
+  return c.json({ data: res?.files ?? [] });
 });
 
 // POST /v1/sessions/:id/commands { type, payload }
@@ -92,11 +97,17 @@ const userCommandTypes = [
   'SEND_MESSAGE', 'ABORT', 'CONTINUE', 'RETRY', 'GET_DIFF', 'REFRESH',
   'REVERT', 'UNREVERT', 'SHARE', 'UNSHARE', 'READ_FILE', 'WRITE_FILE',
 ] as const;
+// Commands that continue or change the conversation need the session to be continued on the PC first.
+const continueCommands = new Set(['SEND_MESSAGE', 'CONTINUE', 'RETRY', 'REVERT', 'UNREVERT', 'WRITE_FILE']);
+
 sessionsRouter.post('/:id/commands', async (c) => {
   const user = c.get('user');
   const session = await ownedSession(user.id, c.req.param('id'));
   const body = z.object({ type: z.enum(userCommandTypes), payload: z.unknown().optional() }).parse(await c.req.json());
   if (!(body.type in commandPayloads)) throw badRequest('Unknown command');
+  if (continueCommands.has(body.type) && !Number(session.remote)) {
+    throw new HttpError(409, 'SESSION_NOT_CONTINUED', 'Continue this session on your PC first, then you can chat in it from here.');
+  }
   const issuer = await resolveIssuer(user.id, c.req.header('X-BK-Device-Id'));
   const res = await createCommand({
     userId: user.id,

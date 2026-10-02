@@ -72,25 +72,11 @@ export function serializeSession(row: any) {
     agent: row.agent,
     model: row.model,
     currentAction: row.current_action,
+    // Phones may chat in this session only after it was continued on the PC.
+    remote: Boolean(Number(row.remote ?? 0)),
     changes: { additions: Number(row.additions), deletions: Number(row.deletions), files: Number(row.files) },
     pendingApprovals: Number(row.pending_approvals ?? 0),
     createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-export function serializePart(row: any) {
-  return {
-    id: row.id,
-    sessionId: row.session_id,
-    messageId: row.message_id,
-    role: row.role,
-    type: row.type,
-    text: row.text,
-    tool: row.tool,
-    toolStatus: row.tool_status,
-    toolTitle: row.tool_title,
-    sortKey: row.sort_key,
     updatedAt: row.updated_at,
   };
 }

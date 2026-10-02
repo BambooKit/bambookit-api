@@ -34,7 +34,7 @@ accountRouter.get('/overview', async (c) => {
       mobiles: devices.filter((d) => d.kind === 'mobile'),
       activeSessions: active.map(serializeSession),
       pendingApprovals: await count("SELECT COUNT(*) AS n FROM approvals WHERE user_id = ? AND status IN ('PENDING','RESPONDING')", userId),
-      recentChangedFiles: await count('SELECT COUNT(*) AS n FROM session_diffs d JOIN sessions s ON s.id = d.session_id WHERE s.user_id = ? AND d.updated_at > ?', userId, dayAgo),
+      recentChangedFiles: await count('SELECT COALESCE(SUM(files), 0) AS n FROM sessions WHERE user_id = ? AND updated_at > ?', userId, dayAgo),
       unreadNotifications: await count('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read_at IS NULL', userId),
     },
   });

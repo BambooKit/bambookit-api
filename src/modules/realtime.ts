@@ -8,11 +8,11 @@ import { expireStaleCommands } from './commands.js';
 
 export const realtimeRouter = new Hono<AppEnv>();
 
-const DESKTOP_EVENTS = new Set(['command.created', 'pairing.completed', 'device.revoked', 'device.unlinked', 'device.updated']);
+const DESKTOP_EVENTS = new Set(['command.created', 'relay.request', 'pairing.completed', 'device.revoked', 'device.unlinked', 'device.updated']);
 
 /** Which events a stream receives. Desktops only get what they must act on. */
 function visibleTo(device: DeviceRow | null, event: BambooEvent): boolean {
-  if (!device || device.kind === 'mobile') return true;
+  if (!device || device.kind === 'mobile') return event.type !== 'relay.request';
   if (!DESKTOP_EVENTS.has(event.type)) return false;
   return event.deviceId === device.id || event.type === 'device.unlinked';
 }
@@ -40,10 +40,13 @@ realtimeRouter.get(
       let closed = false;
 
       const send = async (event: BambooEvent) => {
-        if (event.seq <= lastSent) return;
-        lastSent = event.seq;
+        // Ephemeral events (seq -1) are live-only: no id, never replayed.
+        if (event.seq >= 0) {
+          if (event.seq <= lastSent) return;
+          lastSent = event.seq;
+        }
         if (!visibleTo(device, event)) return;
-        await stream.writeSSE({ id: String(event.seq), event: event.type, data: JSON.stringify(event) });
+        await stream.writeSSE({ ...(event.seq >= 0 ? { id: String(event.seq) } : {}), event: event.type, data: JSON.stringify(event) });
       };
       const drain = async () => {
         if (draining) return;

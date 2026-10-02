@@ -69,6 +69,34 @@ export async function publish(input: {
   return event;
 }
 
+/**
+ * Deliver an event to the user's open streams without storing it anywhere. Used for session
+ * content (chat parts, diffs, live activity) and relay requests: that data lives on the PC, so
+ * clients that are not connected simply fetch it from the PC later. Ephemeral events have seq -1.
+ */
+export function emitEphemeral(input: {
+  userId: string;
+  type: string;
+  payload: unknown;
+  deviceId?: string | null;
+  projectId?: string | null;
+  sessionId?: string | null;
+}): BambooEvent {
+  const event: BambooEvent = {
+    seq: -1,
+    id: newId('evt'),
+    timestamp: now(),
+    userId: input.userId,
+    deviceId: input.deviceId ?? null,
+    projectId: input.projectId ?? null,
+    sessionId: input.sessionId ?? null,
+    type: input.type,
+    payload: input.payload ?? {},
+  };
+  emitter.emit(`user:${input.userId}`, event);
+  return event;
+}
+
 export function subscribe(userId: string, listener: (event: BambooEvent) => void): () => void {
   emitter.on(`user:${userId}`, listener);
   return () => emitter.off(`user:${userId}`, listener);

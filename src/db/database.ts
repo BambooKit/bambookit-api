@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   deletions INTEGER NOT NULL DEFAULT 0,
   files INTEGER NOT NULL DEFAULT 0,
   current_action TEXT,
+  remote INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE (device_id, opencode_session_id)
@@ -337,6 +338,16 @@ async function openPostgres(url: string): Promise<Database> {
 }
 
 export const db: Database = env.POSTGRES_URL ? await openPostgres(env.POSTGRES_URL) : await openSqlite(env.DATABASE_PATH);
+
+/** Upgrades for databases created by earlier versions. Safe to run on every start. */
+async function migrate(d: Database) {
+  await d.run('ALTER TABLE sessions ADD COLUMN remote INTEGER NOT NULL DEFAULT 0').catch(() => undefined);
+  // Session chats, diffs and activity now live only on the PC; remove copies stored by earlier versions.
+  await d.run('DELETE FROM session_parts');
+  await d.run('DELETE FROM session_diffs');
+  await d.run("DELETE FROM events WHERE type IN ('session.part', 'session.transcript', 'session.diff', 'activity')");
+}
+await migrate(db);
 
 export function now(): string {
   return new Date().toISOString();

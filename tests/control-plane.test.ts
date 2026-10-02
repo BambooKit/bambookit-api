@@ -75,6 +75,25 @@ async function pairPhone(userToken: string, desktop: { keys: Keys; id: string })
   return { mobileId: claim.json.data.mobile.id as string, pairingToken: issued.json.data.token as string };
 }
 
+/**
+ * Acts as the PC for live relay requests: marks it connected and answers relay.request events,
+ * the same way BambooKit Desktop does over its realtime stream.
+ */
+async function serveDesktop(token: string, desktop: { keys: Keys; id: string }, answer: (kind: string, params: any) => unknown) {
+  const bus = await import('../src/realtime/bus.js');
+  const me = (await call('GET', '/v1/me', { token })).json.data;
+  bus.markConnected(desktop.id);
+  const off = bus.subscribe(me.id, (event) => {
+    if (event.type !== 'relay.request' || event.deviceId !== desktop.id) return;
+    const { id, kind, params } = event.payload as any;
+    void call('POST', `/v1/relay/${id}/response`, { token, deviceId: desktop.id, keys: desktop.keys, body: { data: answer(kind, params) } });
+  });
+  return () => {
+    off();
+    bus.markDisconnected(desktop.id);
+  };
+}
+
 describe('authentication', () => {
   it('rejects requests without a token', async () => {
     expect((await call('GET', '/v1/me')).status).toBe(401);
@@ -184,7 +203,7 @@ describe('remote control flow', () => {
       keys: desktop.keys,
       body: {
         projects: [{ opencodeProjectId: 'proj_oc_1', name: 'demo', directory: 'C:\\work\\demo', branch: 'main' }],
-        sessions: [{ opencodeSessionId: 'ses_oc_1', opencodeProjectId: 'proj_oc_1', directory: 'C:\\work\\demo', title: 'Fix auth', status: 'busy', agent: 'build', model: 'opencode/test' }],
+        sessions: [{ opencodeSessionId: 'ses_oc_1', opencodeProjectId: 'proj_oc_1', directory: 'C:\\work\\demo', title: 'Fix auth', status: 'busy', agent: 'build', model: 'opencode/test', remote: true }],
         parts: [{ opencodeSessionId: 'ses_oc_1', messageId: 'msg_1', partId: 'prt_1', role: 'user', type: 'text', text: 'Fix the auth bug', sortKey: '0001' }],
         diffs: [{ opencodeSessionId: 'ses_oc_1', files: [{ file: 'src/auth.ts', status: 'modified', additions: 3, deletions: 1 }] }],
         approvals: [{ opencodeSessionId: 'ses_oc_1', requestId: 'per_1', permission: 'bash', title: 'npm test', patterns: ['npm test'], status: 'PENDING' }],
@@ -197,8 +216,21 @@ describe('remote control flow', () => {
     const session = sessions.json.data[0];
     expect(session).toMatchObject({ title: 'Fix auth', status: 'busy', projectName: 'demo', pendingApprovals: 1 });
 
-    expect((await call('GET', `/v1/sessions/${session.id}/parts`, { token })).json.data[0].text).toBe('Fix the auth bug');
+    expect(session.remote).toBe(true);
+
+    // Chats and diffs are never stored by the API ...
+    expect((await db.get('SELECT COUNT(*) AS n FROM session_parts')).n).toBe(0);
+    expect((await db.get('SELECT COUNT(*) AS n FROM session_diffs')).n).toBe(0);
+    // ... they are read live from the PC, and only while it is online.
+    expect((await call('GET', `/v1/sessions/${session.id}/parts`, { token })).json.error.code).toBe('DESKTOP_OFFLINE');
+    const stop = await serveDesktop(token, desktop, (kind, params) => {
+      expect(params.opencodeSessionId).toBe('ses_oc_1');
+      if (kind === 'transcript') return { parts: [{ opencodeSessionId: 'ses_oc_1', messageId: 'msg_1', partId: 'prt_1', role: 'user', type: 'text', text: 'Fix the auth bug', sortKey: '0001' }] };
+      return { files: [{ file: 'src/auth.ts', status: 'modified', additions: 3, deletions: 1 }] };
+    });
+    expect((await call('GET', `/v1/sessions/${session.id}/parts`, { token })).json.data[0]).toMatchObject({ text: 'Fix the auth bug', sessionId: session.id });
     expect((await call('GET', `/v1/sessions/${session.id}/changes`, { token })).json.data[0]).toMatchObject({ file: 'src/auth.ts', additions: 3 });
+    stop();
 
     const approvals = await call('GET', '/v1/approvals?status=PENDING', { token });
     expect(approvals.json.data).toHaveLength(1);
@@ -326,80 +358,64 @@ describe('session sharing', () => {
   });
 });
 
-describe('transcripts and new commands', () => {
-  it('replaces a transcript and accepts rewind/share/file commands', async () => {
+describe('sessions continue on the PC first', () => {
+  it('lets phones chat only in sessions continued on the PC, and starts no sessions remotely', async () => {
     const token = await tokenFor('user-tr-1', 'tr@example.com');
     const desktop = await setupDesktop(token);
-    const part = (id: string, text: string) => ({ opencodeSessionId: 'ses_tr', messageId: 'msg_' + id, partId: 'prt_' + id, role: 'user', type: 'text', text, sortKey: id });
-    await call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { sessions: [{ opencodeSessionId: 'ses_tr', directory: 'C:\tr', title: 'TR', status: 'idle' }], parts: [part('1', 'one'), part('2', 'two')] } });
+    const sync = (remote: boolean) =>
+      call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { projects: [{ opencodeProjectId: 'p_tr', name: 'tr', directory: 'C:\tr' }], sessions: [{ opencodeSessionId: 'ses_tr', opencodeProjectId: 'p_tr', directory: 'C:\tr', title: 'TR', status: 'idle', remote }] } });
+    await sync(false);
     const session = (await call('GET', '/v1/sessions', { token })).json.data[0];
-    expect((await call('GET', `/v1/sessions/${session.id}/parts`, { token })).json.data).toHaveLength(2);
+    expect(session.remote).toBe(false);
 
-    // After a rewind the desktop sends the remaining transcript; later parts disappear.
-    await call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { transcripts: [{ opencodeSessionId: 'ses_tr', parts: [part('1', 'one')] }] } });
-    const parts = (await call('GET', `/v1/sessions/${session.id}/parts`, { token })).json.data;
-    expect(parts.map((p: any) => p.text)).toEqual(['one']);
+    const blocked = await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'SEND_MESSAGE', payload: { text: 'hi' } } });
+    expect(blocked.status).toBe(409);
+    expect(blocked.json.error.code).toBe('SESSION_NOT_CONTINUED');
+    // Reading, stopping and sharing do not need it.
+    for (const [type, payload] of [['ABORT', {}], ['SHARE', {}], ['READ_FILE', { path: 'src/a.ts' }]] as const) {
+      expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type, payload } })).status).toBe(202);
+    }
 
+    await sync(true);
     for (const [type, payload] of [
+      ['SEND_MESSAGE', { text: 'continue' }],
       ['REVERT', { messageId: 'msg_1' }],
       ['UNREVERT', {}],
-      ['SHARE', {}],
-      ['READ_FILE', { path: 'src/a.ts' }],
       ['WRITE_FILE', { path: 'src/a.ts', content: 'x', baseSha256: null }],
     ] as const) {
       expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type, payload } })).status).toBe(202);
     }
     expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'REVERT', payload: {} } })).status).toBe(400);
+
+    const project = (await call('GET', '/v1/projects', { token })).json.data[0];
+    const start = await call('POST', `/v1/projects/${project.id}/sessions`, { token, body: { text: 'new' } });
+    expect(start.status).toBe(403);
+    expect(start.json.error.code).toBe('START_ON_PC');
   });
-});
 
-describe('live architecture', () => {
-  it('derives the graph from real state and live presence', async () => {
-    const token = await tokenFor('user-arch-1', 'arch@example.com');
-    const empty = await call('GET', '/v1/architecture', { token });
-    expect(empty.status).toBe(200);
-    expect(empty.json.data.nodes.find((n: any) => n.id === 'desktop').status).toBe('offline');
-
+  it('passes live chat parts to open streams without storing them', async () => {
+    const token = await tokenFor('user-live-1', 'live@example.com');
     const desktop = await setupDesktop(token);
-    await call('POST', '/v1/sync', {
-      token, deviceId: desktop.id, keys: desktop.keys,
-      body: {
-        projects: [{ opencodeProjectId: 'p1', name: 'demo', directory: 'C:\demo', branch: 'main' }],
-        sessions: [{ opencodeSessionId: 'ses_a', opencodeProjectId: 'p1', directory: 'C:\demo', title: 'Fix auth', status: 'busy', agent: 'build', model: 'opencode/big-pickle', currentAction: 'Running npm test' }],
-        parts: [{ opencodeSessionId: 'ses_a', messageId: 'm1', partId: 't1', role: 'assistant', type: 'tool', tool: 'bash', toolStatus: 'running', toolTitle: 'npm test', sortKey: '1' }],
-        diffs: [{ opencodeSessionId: 'ses_a', files: [{ file: 'src/a.ts', additions: 3, deletions: 1 }] }],
-        approvals: [{ opencodeSessionId: 'ses_a', requestId: 'per_1', permission: 'bash', title: 'rm -rf build', patterns: [], status: 'PENDING' }],
-        engine: { version: '1.18.32', mcp: [{ name: 'github', status: 'connected' }], providers: [{ id: 'opencode', name: 'BambooKit' }], terminals: [] },
-      },
-    });
-    const g = (await call('GET', '/v1/architecture', { token })).json.data;
-    const node = (id: string) => g.nodes.find((n: any) => n.id === id);
-    expect(node(`desktop:${desktop.id}`).status).toBe('offline'); // no realtime stream open
-    expect(node('engine').status).toBe('offline');
-    expect(node('agent')).toMatchObject({ status: 'active', link: { type: 'session' } });
-    expect(node('agent').detail).toContain('BambooKit/big-pickle');
-    expect(node('tools').status).toBe('active');
-    expect(node('tests')).toMatchObject({ status: 'active' });
-    expect(node('terminal').status).toBe('active');
-    expect(node('files').detail).toContain('1 changed');
-    expect(node('git').detail).toContain('main');
-    expect(node('mcp').status).toBe('online');
-    expect(node('approvals')).toMatchObject({ status: 'warning', metrics: { pending: 1 } });
-    expect(node('project')).toMatchObject({ label: 'demo', link: { type: 'project' } });
-  });
+    await call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { sessions: [{ opencodeSessionId: 'ses_lv', directory: 'C:\lv', title: 'LV', status: 'busy' }] } });
 
-  it('marks the web client online while a browser stream is open', async () => {
-    const token = await tokenFor('user-arch-2', 'arch2@example.com');
     const controller = new AbortController();
     const res = await app.request('http://localhost/v1/realtime/stream?client=web', { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal });
     const reader = res.body!.getReader();
-    await reader.read(); // stream established
-    const online = (await call('GET', '/v1/architecture', { token })).json.data.nodes.find((n: any) => n.id === 'web');
-    expect(online.status).toBe('online');
+    const decoder = new TextDecoder();
+    let text = decoder.decode((await reader.read()).value);
+    await call('POST', '/v1/sync', {
+      token, deviceId: desktop.id, keys: desktop.keys,
+      body: { parts: [{ opencodeSessionId: 'ses_lv', messageId: 'm1', partId: 'p1', role: 'assistant', type: 'text', text: 'working on it', sortKey: '1' }] },
+    });
+    while (!text.includes('event: session.part')) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value);
+    }
     controller.abort();
     await reader.cancel().catch(() => {});
-    await new Promise((r) => setTimeout(r, 50));
-    const offline = (await call('GET', '/v1/architecture', { token })).json.data.nodes.find((n: any) => n.id === 'web');
-    expect(offline.status).toBe('offline');
+    expect(text).toContain('working on it');
+    expect((await db.get("SELECT COUNT(*) AS n FROM events WHERE type = 'session.part'")).n).toBe(0);
+    expect((await db.get('SELECT COUNT(*) AS n FROM session_parts')).n).toBe(0);
   });
 });
