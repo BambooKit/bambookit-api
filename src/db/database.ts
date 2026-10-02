@@ -173,6 +173,12 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, created_at);
+CREATE TABLE IF NOT EXISTS device_state (
+  device_id TEXT PRIMARY KEY REFERENCES devices(id),
+  user_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS shares (
   id TEXT PRIMARY KEY,
   secret_hash TEXT NOT NULL,

@@ -15,7 +15,9 @@ const ACTIVE_SESSION_FOR_DEVICE = `
 
 export function isDeviceOnline(row: DeviceRow): boolean {
   if (row.revoked_at) return false;
-  if (row.kind === 'desktop') return isConnected(row.id);
+  // A device is online while it holds a realtime stream; phones also count as online shortly after any request.
+  if (isConnected(row.id)) return true;
+  if (row.kind === 'desktop') return false;
   return !!row.last_seen_at && Date.now() - Date.parse(row.last_seen_at) < 120_000;
 }
 

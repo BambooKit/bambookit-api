@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { db } from '../db/database.js';
 import { requireDevice, requireUser, type AppEnv, type DeviceRow } from '../middleware/auth.js';
-import { currentSeq, eventsAfter, markConnected, markDisconnected, publish, subscribe, type BambooEvent } from '../realtime/bus.js';
+import { currentSeq, eventsAfter, markConnected, markDisconnected, publish, subscribe, webConnected, webDisconnected, type BambooEvent } from '../realtime/bus.js';
 import { serializeDevice } from './serializers.js';
 import { expireStaleCommands } from './commands.js';
 
@@ -64,6 +64,13 @@ realtimeRouter.get(
       });
 
       const isDesktop = device?.kind === 'desktop';
+      const isWeb = !device && c.req.query('client') === 'web';
+      if (device && device.kind === 'mobile' && markConnected(device.id)) {
+        await publish({ userId: user.id, deviceId: device.id, type: 'presence.changed', payload: { kind: 'mobile', deviceId: device.id, online: true } });
+      }
+      if (isWeb && webConnected(user.id)) {
+        await publish({ userId: user.id, type: 'presence.changed', payload: { kind: 'web', online: true } });
+      }
       if (isDesktop && markConnected(device.id)) {
         const row = await db.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', device.id);
         if (row) await publish({ userId: user.id, deviceId: device.id, type: 'device.status', payload: await serializeDevice(row) });
@@ -72,6 +79,12 @@ realtimeRouter.get(
       stream.onAbort(() => {
         closed = true;
         unsubscribe();
+        if (device && device.kind === 'mobile' && markDisconnected(device.id)) {
+          void publish({ userId: user.id, deviceId: device.id, type: 'presence.changed', payload: { kind: 'mobile', deviceId: device.id, online: false } }).catch(() => undefined);
+        }
+        if (isWeb && webDisconnected(user.id)) {
+          void publish({ userId: user.id, type: 'presence.changed', payload: { kind: 'web', online: false } }).catch(() => undefined);
+        }
         if (isDesktop && markDisconnected(device.id)) {
           void (async () => {
             const row = await db.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', device.id);

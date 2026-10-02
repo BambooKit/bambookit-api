@@ -16,6 +16,7 @@ import { notificationsRouter } from './modules/notifications.js';
 import { syncRouter } from './modules/sync.js';
 import { realtimeRouter } from './modules/realtime.js';
 import { sharesRouter } from './modules/shares.js';
+import { architectureRouter } from './modules/architecture.js';
 
 export const app = new Hono<AppEnv>();
 
@@ -57,6 +58,7 @@ v1.route('/approvals', approvalsRouter);
 v1.route('/notifications', notificationsRouter);
 v1.route('/sync', syncRouter);
 v1.route('/realtime', realtimeRouter);
+v1.route('/architecture', architectureRouter);
 
 app.route('/v1', v1);
 // Public session sharing (OpenCode share protocol + viewer). No user auth: secrets authorize writes.

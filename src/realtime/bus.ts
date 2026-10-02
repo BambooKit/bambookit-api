@@ -118,3 +118,31 @@ export function markDisconnected(deviceId: string): boolean {
 export function isConnected(deviceId: string): boolean {
   return (connections.get(deviceId) ?? 0) > 0;
 }
+
+// Browser (BambooKit Web) streams have no device; count them per user.
+const webConnections = new Map<string, number>();
+
+export function webConnected(userId: string): boolean {
+  const n = (webConnections.get(userId) ?? 0) + 1;
+  webConnections.set(userId, n);
+  return n === 1;
+}
+
+export function webDisconnected(userId: string): boolean {
+  const n = (webConnections.get(userId) ?? 1) - 1;
+  if (n <= 0) {
+    webConnections.delete(userId);
+    return true;
+  }
+  webConnections.set(userId, n);
+  return false;
+}
+
+export function webCount(userId: string): number {
+  return webConnections.get(userId) ?? 0;
+}
+
+/** Total live realtime streams for a user (all clients). */
+export function streamCount(userId: string, deviceIds: string[]): number {
+  return webCount(userId) + deviceIds.reduce((n, id) => n + (connections.get(id) ?? 0), 0);
+}

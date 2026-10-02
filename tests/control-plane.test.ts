@@ -352,3 +352,54 @@ describe('transcripts and new commands', () => {
     expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'REVERT', payload: {} } })).status).toBe(400);
   });
 });
+
+describe('live architecture', () => {
+  it('derives the graph from real state and live presence', async () => {
+    const token = await tokenFor('user-arch-1', 'arch@example.com');
+    const empty = await call('GET', '/v1/architecture', { token });
+    expect(empty.status).toBe(200);
+    expect(empty.json.data.nodes.find((n: any) => n.id === 'desktop').status).toBe('offline');
+
+    const desktop = await setupDesktop(token);
+    await call('POST', '/v1/sync', {
+      token, deviceId: desktop.id, keys: desktop.keys,
+      body: {
+        projects: [{ opencodeProjectId: 'p1', name: 'demo', directory: 'C:\demo', branch: 'main' }],
+        sessions: [{ opencodeSessionId: 'ses_a', opencodeProjectId: 'p1', directory: 'C:\demo', title: 'Fix auth', status: 'busy', agent: 'build', model: 'opencode/big-pickle', currentAction: 'Running npm test' }],
+        parts: [{ opencodeSessionId: 'ses_a', messageId: 'm1', partId: 't1', role: 'assistant', type: 'tool', tool: 'bash', toolStatus: 'running', toolTitle: 'npm test', sortKey: '1' }],
+        diffs: [{ opencodeSessionId: 'ses_a', files: [{ file: 'src/a.ts', additions: 3, deletions: 1 }] }],
+        approvals: [{ opencodeSessionId: 'ses_a', requestId: 'per_1', permission: 'bash', title: 'rm -rf build', patterns: [], status: 'PENDING' }],
+        engine: { version: '1.18.32', mcp: [{ name: 'github', status: 'connected' }], providers: [{ id: 'opencode', name: 'BambooKit' }], terminals: [] },
+      },
+    });
+    const g = (await call('GET', '/v1/architecture', { token })).json.data;
+    const node = (id: string) => g.nodes.find((n: any) => n.id === id);
+    expect(node(`desktop:${desktop.id}`).status).toBe('offline'); // no realtime stream open
+    expect(node('engine').status).toBe('offline');
+    expect(node('agent')).toMatchObject({ status: 'active', link: { type: 'session' } });
+    expect(node('agent').detail).toContain('BambooKit/big-pickle');
+    expect(node('tools').status).toBe('active');
+    expect(node('tests')).toMatchObject({ status: 'active' });
+    expect(node('terminal').status).toBe('active');
+    expect(node('files').detail).toContain('1 changed');
+    expect(node('git').detail).toContain('main');
+    expect(node('mcp').status).toBe('online');
+    expect(node('approvals')).toMatchObject({ status: 'warning', metrics: { pending: 1 } });
+    expect(node('project')).toMatchObject({ label: 'demo', link: { type: 'project' } });
+  });
+
+  it('marks the web client online while a browser stream is open', async () => {
+    const token = await tokenFor('user-arch-2', 'arch2@example.com');
+    const controller = new AbortController();
+    const res = await app.request('http://localhost/v1/realtime/stream?client=web', { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal });
+    const reader = res.body!.getReader();
+    await reader.read(); // stream established
+    const online = (await call('GET', '/v1/architecture', { token })).json.data.nodes.find((n: any) => n.id === 'web');
+    expect(online.status).toBe('online');
+    controller.abort();
+    await reader.cancel().catch(() => {});
+    await new Promise((r) => setTimeout(r, 50));
+    const offline = (await call('GET', '/v1/architecture', { token })).json.data.nodes.find((n: any) => n.id === 'web');
+    expect(offline.status).toBe('offline');
+  });
+});

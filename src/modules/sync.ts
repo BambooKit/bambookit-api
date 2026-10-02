@@ -86,6 +86,15 @@ const syncSchema = z.object({
     )
     .max(200)
     .optional(),
+  // Local engine state reported by the desktop (for the live architecture map). Names and statuses only.
+  engine: z
+    .object({
+      version: z.string().max(40).nullish(),
+      mcp: z.array(z.object({ name: z.string().max(100), status: z.string().max(40) })).max(100).default([]),
+      providers: z.array(z.object({ id: z.string().max(100), name: z.string().max(100) })).max(200).default([]),
+      terminals: z.array(z.object({ id: z.string().max(100), title: z.string().max(200).nullish(), status: z.string().max(40).nullish() })).max(50).default([]),
+    })
+    .optional(),
   // Complete list of request ids still pending on the desktop; anything else pending is expired.
   pendingApprovalSnapshot: z.array(z.string().max(200)).max(500).optional(),
   activity: z
@@ -237,6 +246,15 @@ syncRouter.post('/', async (c) => {
         await q.run("UPDATE approvals SET status = 'EXPIRED', resolved_at = ? WHERE id = ?", ts, p.id);
         out.push({ userId: user.id, deviceId: device.id, sessionId: p.session_id, type: 'approval.updated', payload: serializeApproval(await approvalRow(p.id)) });
       }
+    }
+
+    if (body.engine) {
+      await q.run(
+        `INSERT INTO device_state (device_id, user_id, state, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(device_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`,
+        device.id, user.id, JSON.stringify(body.engine), ts,
+      );
+      out.push({ userId: user.id, deviceId: device.id, type: 'engine.updated', payload: body.engine });
     }
 
     for (const a of body.activity ?? []) {
