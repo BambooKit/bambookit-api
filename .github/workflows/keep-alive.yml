@@ -1,6 +1,6 @@
-# Keeps the Render free-tier API awake: Render stops a free web service after ~15 minutes without
-# traffic, and the next request then waits 20-50 s for a cold start. One always-on free service
-# fits within Render's 750 free instance hours per month.
+# Backup wake-up for the Render free-tier API (the API also pings itself every 10 minutes while it
+# runs; this wakes it again if it was ever stopped). GitHub may delay or skip scheduled runs, so an
+# external monitor such as UptimeRobot pointed at /ready is the most reliable extra safeguard.
 name: keep-alive
 on:
   schedule:
@@ -11,4 +11,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping BambooKit API
-        run: curl --silent --show-error --fail --max-time 90 --retry 2 https://bambookit-api.onrender.com/health
+        run: curl --silent --show-error --fail --max-time 90 --retry 2 https://bambookit-api.onrender.com/ready
