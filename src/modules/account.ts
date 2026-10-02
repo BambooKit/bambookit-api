@@ -8,45 +8,47 @@ export const accountRouter = new Hono<AppEnv>();
 accountRouter.use('*', requireUser);
 
 // GET /v1/me
-accountRouter.get('/me', (c) => {
+accountRouter.get('/me', async (c) => {
   const user = c.get('user');
-  const row = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id) as any;
+  const row = await db.get('SELECT * FROM users WHERE id = ?', user.id);
   return c.json({ data: { id: user.id, email: user.email, name: row?.name ?? user.name, avatarUrl: row?.avatar_url ?? user.avatarUrl, createdAt: row?.created_at } });
 });
 
+const count = async (sql: string, ...args: unknown[]) => Number((await db.get(sql, ...args))?.n ?? 0);
+
 // GET /v1/overview — real counts for the mobile/web home screen
-accountRouter.get('/overview', (c) => {
+accountRouter.get('/overview', async (c) => {
   const userId = c.get('user').id;
-  const devices = (db.prepare('SELECT * FROM devices WHERE user_id = ? AND revoked_at IS NULL').all(userId) as unknown as DeviceRow[]).map(serializeDevice);
-  const active = db
-    .prepare(`SELECT s.*, p.name AS project_name,
+  const devices = await Promise.all((await db.all<DeviceRow>('SELECT * FROM devices WHERE user_id = ? AND revoked_at IS NULL', userId)).map(serializeDevice));
+  const active = await db.all(
+    `SELECT s.*, p.name AS project_name,
         (SELECT COUNT(*) FROM approvals a WHERE a.session_id = s.id AND a.status IN ('PENDING','RESPONDING')) AS pending_approvals
       FROM sessions s LEFT JOIN projects p ON p.id = s.project_id
-      WHERE s.user_id = ? AND s.status IN ('busy','retry') AND s.parent_opencode_session_id IS NULL ORDER BY s.updated_at DESC`)
-    .all(userId);
-  const pendingApprovals = Number((db.prepare("SELECT COUNT(*) AS n FROM approvals WHERE user_id = ? AND status IN ('PENDING','RESPONDING')").get(userId) as any).n);
-  const changedFiles = Number(
-    (db.prepare("SELECT COUNT(*) AS n FROM session_diffs d JOIN sessions s ON s.id = d.session_id WHERE s.user_id = ? AND d.updated_at > datetime('now','-1 day')").get(userId) as any).n,
+      WHERE s.user_id = ? AND s.status IN ('busy','retry') AND s.parent_opencode_session_id IS NULL ORDER BY s.updated_at DESC`,
+    userId,
   );
-  const unread = Number((db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read_at IS NULL').get(userId) as any).n);
+  const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
   return c.json({
     data: {
       desktops: devices.filter((d) => d.kind === 'desktop'),
       mobiles: devices.filter((d) => d.kind === 'mobile'),
       activeSessions: active.map(serializeSession),
-      pendingApprovals,
-      recentChangedFiles: changedFiles,
-      unreadNotifications: unread,
+      pendingApprovals: await count("SELECT COUNT(*) AS n FROM approvals WHERE user_id = ? AND status IN ('PENDING','RESPONDING')", userId),
+      recentChangedFiles: await count('SELECT COUNT(*) AS n FROM session_diffs d JOIN sessions s ON s.id = d.session_id WHERE s.user_id = ? AND d.updated_at > ?', userId, dayAgo),
+      unreadNotifications: await count('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read_at IS NULL', userId),
     },
   });
 });
 
 // GET /v1/activity?before=<seq>
 const ACTIVITY_TYPES = ['activity', 'approval.created', 'approval.updated', 'pairing.completed', 'device.registered', 'device.revoked', 'notification'];
-accountRouter.get('/activity', (c) => {
+accountRouter.get('/activity', async (c) => {
   const before = Number(c.req.query('before') ?? Number.MAX_SAFE_INTEGER);
-  const rows = db
-    .prepare(`SELECT * FROM events WHERE user_id = ? AND seq < ? AND type IN (${ACTIVITY_TYPES.map(() => '?').join(',')}) ORDER BY seq DESC LIMIT 100`)
-    .all(c.get('user').id, before, ...ACTIVITY_TYPES);
+  const rows = await db.all(
+    `SELECT * FROM events WHERE user_id = ? AND seq < ? AND type IN (${ACTIVITY_TYPES.map(() => '?').join(',')}) ORDER BY seq DESC LIMIT 100`,
+    c.get('user').id,
+    before,
+    ...ACTIVITY_TYPES,
+  );
   return c.json({ data: rows.map(rowToEvent) });
 });

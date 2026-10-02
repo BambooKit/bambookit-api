@@ -2,15 +2,19 @@
   "name": "bambookit-api",
   "version": "0.2.0",
   "private": true,
+  "type": "module",
   "description": "BambooKit control plane: auth, devices, QR pairing, session registry, remote commands, approvals, realtime",
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:postgres": "vitest run tests/control-plane.test.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.8",
@@ -18,11 +22,14 @@
     "dotenv": "^16.4.7",
     "hono": "^4.7.4",
     "jose": "^5.10.0",
+    "pg": "^8.23.1",
     "typescript": "^5.8.2",
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@types/node": "^24.19.0",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.19.3",
     "vitest": "^3.0.7"
   }

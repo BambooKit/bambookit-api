@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { randomBytes } from 'node:crypto';
 import { env } from '../config/env.js';
-import { db, now, tx } from '../db/database.js';
+import { db, now } from '../db/database.js';
 import { requireDevice, requireUser, type AppEnv, type DeviceRow } from '../middleware/auth.js';
 import { HttpError, forbidden, newId, sha256, stableId } from '../lib/http.js';
 import { publish } from '../realtime/bus.js';
@@ -16,31 +16,27 @@ pairingRouter.use('*', requireUser);
  * Issues a short-lived, single-use pairing token for display as a QR code.
  * Only the SHA-256 of the token is stored. Any earlier unused token for this desktop is invalidated.
  */
-pairingRouter.post('/tokens', requireDevice('desktop'), (c) => {
+pairingRouter.post('/tokens', requireDevice('desktop'), async (c) => {
   const user = c.get('user');
   const desktop = c.get('device')!;
   const token = randomBytes(32).toString('base64url');
   const ts = now();
   const expiresAt = new Date(Date.now() + env.PAIRING_TOKEN_TTL_SECONDS * 1000).toISOString();
 
-  tx(() => {
-    db.prepare('UPDATE pairing_tokens SET used_at = ? WHERE desktop_id = ? AND used_at IS NULL').run(ts, desktop.id);
-    db.prepare(
+  await db.tx(async (q) => {
+    await q.run('UPDATE pairing_tokens SET used_at = ? WHERE desktop_id = ? AND used_at IS NULL', ts, desktop.id);
+    await q.run(
       'INSERT INTO pairing_tokens (id, token_hash, user_id, desktop_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-    ).run(newId('pair'), sha256(token), user.id, desktop.id, expiresAt, ts);
+      newId('pair'),
+      sha256(token),
+      user.id,
+      desktop.id,
+      expiresAt,
+      ts,
+    );
   });
 
-  return c.json(
-    {
-      data: {
-        token,
-        expiresAt,
-        ttlSeconds: env.PAIRING_TOKEN_TTL_SECONDS,
-        uri: `bambookit://pair?t=${token}`,
-      },
-    },
-    201,
-  );
+  return c.json({ data: { token, expiresAt, ttlSeconds: env.PAIRING_TOKEN_TTL_SECONDS, uri: `bambookit://pair?t=${token}` } }, 201);
 });
 
 const claimSchema = z.object({
@@ -63,37 +59,42 @@ pairingRouter.post('/claim', async (c) => {
   const body = claimSchema.parse(await c.req.json());
   const ts = now();
 
-  const result = tx(() => {
-    const row = db.prepare('SELECT * FROM pairing_tokens WHERE token_hash = ?').get(sha256(body.token)) as any;
+  const result = await db.tx(async (q) => {
+    const row = await q.get('SELECT * FROM pairing_tokens WHERE token_hash = ?', sha256(body.token));
     if (!row) throw new HttpError(404, 'PAIRING_TOKEN_INVALID', 'This QR code is not valid. Generate a new one on the desktop.');
     if (row.used_at) throw new HttpError(410, 'PAIRING_TOKEN_USED', 'This QR code was already used. Generate a new one on the desktop.');
     if (Date.parse(row.expires_at) < Date.now()) throw new HttpError(410, 'PAIRING_TOKEN_EXPIRED', 'This QR code has expired. Generate a new one on the desktop.');
-    if (row.user_id !== user.id) {
-      throw forbidden('This desktop is signed in to a different BambooKit account.', 'ACCOUNT_MISMATCH');
-    }
+    if (row.user_id !== user.id) throw forbidden('This desktop is signed in to a different BambooKit account.', 'ACCOUNT_MISMATCH');
 
-    const desktop = db.prepare('SELECT * FROM devices WHERE id = ?').get(row.desktop_id) as unknown as DeviceRow;
+    const desktop = await q.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', row.desktop_id);
     if (!desktop || desktop.revoked_at) throw forbidden('The desktop device has been revoked', 'DEVICE_REVOKED');
 
     const mobileId = stableId('mob', user.id, body.mobile.installationId);
-    const existing = db.prepare('SELECT * FROM devices WHERE id = ?').get(mobileId) as unknown as DeviceRow | undefined;
+    const existing = await q.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', mobileId);
     if (existing?.revoked_at) throw forbidden('This phone was revoked. Reinstall the app to pair again.', 'DEVICE_REVOKED');
 
-    db.prepare(`
-      INSERT INTO devices (id, user_id, kind, name, platform, app_version, push_token, last_seen_at, created_at)
-      VALUES (?, ?, 'mobile', ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET name = excluded.name, platform = excluded.platform,
-        app_version = excluded.app_version, push_token = COALESCE(excluded.push_token, devices.push_token),
-        last_seen_at = excluded.last_seen_at
-    `).run(mobileId, user.id, body.mobile.name, body.mobile.platform, body.mobile.appVersion ?? null, body.mobile.pushToken ?? null, ts, ts);
+    await q.run(
+      `INSERT INTO devices (id, user_id, kind, name, platform, app_version, push_token, last_seen_at, created_at)
+       VALUES (?, ?, 'mobile', ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET name = excluded.name, platform = excluded.platform,
+         app_version = excluded.app_version, push_token = COALESCE(excluded.push_token, devices.push_token),
+         last_seen_at = excluded.last_seen_at`,
+      mobileId,
+      user.id,
+      body.mobile.name,
+      body.mobile.platform,
+      body.mobile.appVersion ?? null,
+      body.mobile.pushToken ?? null,
+      ts,
+      ts,
+    );
 
     // Single use: the WHERE clause guarantees only one concurrent claim can succeed.
-    const consumed = db
-      .prepare('UPDATE pairing_tokens SET used_at = ?, used_by_device_id = ? WHERE id = ? AND used_at IS NULL')
-      .run(ts, mobileId, row.id);
+    const consumed = await q.run('UPDATE pairing_tokens SET used_at = ?, used_by_device_id = ? WHERE id = ? AND used_at IS NULL', ts, mobileId, row.id);
     if (consumed.changes !== 1) throw new HttpError(410, 'PAIRING_TOKEN_USED', 'This QR code was already used.');
 
-    db.prepare('INSERT OR IGNORE INTO device_links (desktop_id, mobile_id, user_id, created_at) VALUES (?, ?, ?, ?)').run(
+    await q.run(
+      'INSERT INTO device_links (desktop_id, mobile_id, user_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (desktop_id, mobile_id) DO NOTHING',
       desktop.id,
       mobileId,
       user.id,
@@ -101,12 +102,12 @@ pairingRouter.post('/claim', async (c) => {
     );
 
     return {
-      desktop: db.prepare('SELECT * FROM devices WHERE id = ?').get(desktop.id) as unknown as DeviceRow,
-      mobile: db.prepare('SELECT * FROM devices WHERE id = ?').get(mobileId) as unknown as DeviceRow,
+      desktop: (await q.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', desktop.id))!,
+      mobile: (await q.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', mobileId))!,
     };
   });
 
-  const payload = { desktop: serializeDevice(result.desktop), mobile: serializeDevice(result.mobile) };
-  publish({ userId: user.id, deviceId: result.desktop.id, type: 'pairing.completed', payload });
+  const payload = { desktop: await serializeDevice(result.desktop), mobile: await serializeDevice(result.mobile) };
+  await publish({ userId: user.id, deviceId: result.desktop.id, type: 'pairing.completed', payload });
   return c.json({ data: payload });
 });

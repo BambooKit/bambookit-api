@@ -18,28 +18,28 @@ export interface BambooEvent {
 const emitter = new EventEmitter();
 emitter.setMaxListeners(0);
 
-const insert = db.prepare(`
+const INSERT_EVENT = `
   INSERT INTO events (id, user_id, device_id, project_id, session_id, type, payload, created_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-`);
-const prune = db.prepare('DELETE FROM events WHERE created_at < ?');
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq
+`;
 let publishedSincePrune = 0;
 
 /**
  * Persist an event and fan it out to the user's live streams.
  * The sequence number lets clients resume with ?after=<seq> without losing events.
  */
-export function publish(input: {
+export async function publish(input: {
   userId: string;
   type: string;
   payload: unknown;
   deviceId?: string | null;
   projectId?: string | null;
   sessionId?: string | null;
-}): BambooEvent {
+}): Promise<BambooEvent> {
   const id = newId('evt');
   const timestamp = now();
-  const result = insert.run(
+  const result = await db.get<{ seq: number }>(
+    INSERT_EVENT,
     id,
     input.userId,
     input.deviceId ?? null,
@@ -50,7 +50,7 @@ export function publish(input: {
     timestamp,
   );
   const event: BambooEvent = {
-    seq: Number(result.lastInsertRowid),
+    seq: Number(result!.seq),
     id,
     timestamp,
     userId: input.userId,
@@ -64,7 +64,7 @@ export function publish(input: {
 
   if (++publishedSincePrune >= 500) {
     publishedSincePrune = 0;
-    prune.run(new Date(Date.now() - env.EVENT_RETENTION_DAYS * 86_400_000).toISOString());
+    await db.run('DELETE FROM events WHERE created_at < ?', new Date(Date.now() - env.EVENT_RETENTION_DAYS * 86_400_000).toISOString());
   }
   return event;
 }
@@ -74,20 +74,17 @@ export function subscribe(userId: string, listener: (event: BambooEvent) => void
   return () => emitter.off(`user:${userId}`, listener);
 }
 
-const listAfter = db.prepare('SELECT * FROM events WHERE user_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?');
-const latestSeq = db.prepare('SELECT MAX(seq) AS seq FROM events WHERE user_id = ?');
-
-export function eventsAfter(userId: string, after: number, limit = 500): BambooEvent[] {
-  return (listAfter.all(userId, after, limit) as any[]).map(rowToEvent);
+export async function eventsAfter(userId: string, after: number, limit = 500): Promise<BambooEvent[]> {
+  return (await db.all('SELECT * FROM events WHERE user_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?', userId, after, limit)).map(rowToEvent);
 }
 
-export function currentSeq(userId: string): number {
-  return Number((latestSeq.get(userId) as any)?.seq ?? 0);
+export async function currentSeq(userId: string): Promise<number> {
+  return Number((await db.get('SELECT MAX(seq) AS seq FROM events WHERE user_id = ?', userId))?.seq ?? 0);
 }
 
 export function rowToEvent(row: any): BambooEvent {
   return {
-    seq: row.seq,
+    seq: Number(row.seq),
     id: row.id,
     timestamp: row.created_at,
     userId: row.user_id,

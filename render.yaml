@@ -1,0 +1,27 @@
+# Render Blueprint for bambookit-api (https://render.com/docs/blueprint-spec).
+# The existing service can keep its dashboard settings; this file documents the expected ones.
+services:
+  - type: web
+    name: bambookit-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22.13.1"
+      - key: NODE_ENV
+        value: production
+      # Persistent storage. Without it, Render's disk is wiped on every restart or deploy.
+      # Supabase → Project settings → Database → Connection string (Session pooler, port 5432).
+      - key: POSTGRES_URL
+        sync: false
+      - key: SUPABASE_URL
+        value: https://skvjitpcpwfprgxvnpdd.supabase.co
+      - key: FIREBASE_PROJECT_ID
+        value: bambookit-product
+      - key: PUBLIC_SHARE_BASE_URL
+        value: https://bambookit-web.onrender.com
+      - key: CORS_ORIGINS
+        value: https://bambookit-web.onrender.com,http://localhost:3000

@@ -34,7 +34,7 @@ realtimeRouter.get(
     const after = afterParam !== undefined && afterParam !== '' ? Number(afterParam) : null;
 
     return streamSSE(c, async (stream) => {
-      let lastSent = after ?? currentSeq(user.id);
+      let lastSent = after ?? (await currentSeq(user.id));
       const queue: BambooEvent[] = [];
       let draining = false;
       let closed = false;
@@ -65,28 +65,31 @@ realtimeRouter.get(
 
       const isDesktop = device?.kind === 'desktop';
       if (isDesktop && markConnected(device.id)) {
-        publish({ userId: user.id, deviceId: device.id, type: 'device.status', payload: serializeDevice(db.prepare('SELECT * FROM devices WHERE id = ?').get(device.id) as unknown as DeviceRow) });
+        const row = await db.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', device.id);
+        if (row) await publish({ userId: user.id, deviceId: device.id, type: 'device.status', payload: await serializeDevice(row) });
       }
 
       stream.onAbort(() => {
         closed = true;
         unsubscribe();
         if (isDesktop && markDisconnected(device.id)) {
-          const row = db.prepare('SELECT * FROM devices WHERE id = ?').get(device.id) as unknown as DeviceRow;
-          publish({ userId: user.id, deviceId: device.id, type: 'device.status', payload: serializeDevice(row) });
+          void (async () => {
+            const row = await db.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', device.id);
+            if (row) await publish({ userId: user.id, deviceId: device.id, type: 'device.status', payload: await serializeDevice(row) });
+          })().catch(() => undefined);
         }
       });
 
-      await stream.writeSSE({ event: 'ready', data: JSON.stringify({ seq: currentSeq(user.id), deviceId: device?.id ?? null }) });
+      await stream.writeSSE({ event: 'ready', data: JSON.stringify({ seq: await currentSeq(user.id), deviceId: device?.id ?? null }) });
 
       if (after !== null) {
         let batch: BambooEvent[];
         do {
-          batch = eventsAfter(user.id, lastSent, 500);
+          batch = await eventsAfter(user.id, lastSent, 500);
           for (const e of batch) await send(e);
         } while (batch.length === 500 && !closed);
       }
-      if (isDesktop) expireStaleCommands(device.id);
+      if (isDesktop) await expireStaleCommands(device.id);
       await drain();
 
       while (!closed) {

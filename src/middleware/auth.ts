@@ -27,7 +27,7 @@ export type AppEnv = {
   };
 };
 
-const upsertUser = db.prepare(`
+const UPSERT_USER = `
   INSERT INTO users (id, email, name, avatar_url, created_at, last_seen_at)
   VALUES (?, ?, ?, ?, ?, ?)
   ON CONFLICT(id) DO UPDATE SET
@@ -35,7 +35,7 @@ const upsertUser = db.prepare(`
     name = COALESCE(excluded.name, users.name),
     avatar_url = COALESCE(excluded.avatar_url, users.avatar_url),
     last_seen_at = excluded.last_seen_at
-`);
+`;
 
 const lastUpsert = new Map<string, number>();
 
@@ -50,7 +50,7 @@ export const requireUser = createMiddleware<AppEnv>(async (c, next) => {
   const last = lastUpsert.get(user.id) ?? 0;
   if (Date.now() - last > 30_000) {
     const ts = now();
-    upsertUser.run(user.id, user.email, user.name, user.avatarUrl, ts, ts);
+    await db.run(UPSERT_USER, user.id, user.email, user.name, user.avatarUrl, ts, ts);
     lastUpsert.set(user.id, Date.now());
   }
   c.set('user', user);
@@ -58,8 +58,7 @@ export const requireUser = createMiddleware<AppEnv>(async (c, next) => {
   await next();
 });
 
-const getDevice = db.prepare('SELECT * FROM devices WHERE id = ?');
-const touchDevice = db.prepare('UPDATE devices SET last_seen_at = ? WHERE id = ?');
+
 
 /** Builds the canonical string a device signs. Shared with clients (see bambookit-sdk). */
 export function signingPayload(method: string, pathWithQuery: string, timestamp: string, body: string): string {
@@ -85,7 +84,7 @@ export function requireDevice(kind?: 'desktop' | 'mobile') {
     const deviceId = c.req.header('X-BK-Device-Id');
     if (!deviceId) throw unauthorized('Device identification required', 'DEVICE_REQUIRED');
 
-    const device = getDevice.get(deviceId) as DeviceRow | undefined;
+    const device = await db.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', deviceId);
     if (!device || device.user_id !== user.id) throw forbidden('Device not registered to this account', 'DEVICE_NOT_OWNED');
     if (device.revoked_at) throw forbidden('Device has been revoked', 'DEVICE_REVOKED');
     if (kind && device.kind !== kind) throw forbidden(`This operation requires a ${kind} device`, 'WRONG_DEVICE_KIND');
@@ -95,7 +94,7 @@ export function requireDevice(kind?: 'desktop' | 'mobile') {
       await requireSignature(c, device.public_key);
     }
 
-    touchDevice.run(now(), device.id);
+    await db.run('UPDATE devices SET last_seen_at = ? WHERE id = ?', now(), device.id);
     c.set('device', device);
     await next();
   });

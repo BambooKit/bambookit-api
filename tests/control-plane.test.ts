@@ -4,6 +4,8 @@ import { SignJWT } from 'jose';
 
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_PATH = ':memory:';
+// TEST_DB=postgres runs the same suite against Postgres (in-process PGlite).
+if (process.env.TEST_DB === 'postgres' || process.env.npm_lifecycle_event === 'test:postgres') process.env.POSTGRES_URL = 'pglite://memory';
 process.env.SUPABASE_URL = 'https://test-project.supabase.co';
 process.env.SUPABASE_JWT_SECRET = 'test-jwt-secret-for-unit-tests-only-0123456789';
 process.env.LOG_LEVEL = 'error';
@@ -162,8 +164,8 @@ describe('QR pairing', () => {
     const issued = await call('POST', '/v1/pairing/tokens', { token, keys: desktop.keys, deviceId: desktop.id, body: {} });
     const raw = issued.json.data.token as string;
     expect(issued.json.data.uri).toBe(`bambookit://pair?t=${raw}`);
-    expect(db.prepare('SELECT COUNT(*) AS n FROM pairing_tokens WHERE token_hash = ?').get(raw)).toMatchObject({ n: 0 });
-    db.prepare("UPDATE pairing_tokens SET expires_at = '2000-01-01T00:00:00.000Z' WHERE desktop_id = ?").run(desktop.id);
+    expect(Number((await db.get('SELECT COUNT(*) AS n FROM pairing_tokens WHERE token_hash = ?', raw))?.n)).toBe(0);
+    await db.run("UPDATE pairing_tokens SET expires_at = '2000-01-01T00:00:00.000Z' WHERE desktop_id = ?", desktop.id);
     const res = await call('POST', '/v1/pairing/claim', { token, body: { token: raw, mobile: { installationId: randomUUID(), name: 'X', platform: 'android' } } });
     expect(res.status).toBe(410);
     expect(res.json.error.code).toBe('PAIRING_TOKEN_EXPIRED');

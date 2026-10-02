@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { createPublicKey } from 'node:crypto';
-import { db, now, tx } from '../db/database.js';
+import { db, now } from '../db/database.js';
 import { requireDevice, requireSignature, requireUser, type AppEnv, type DeviceRow } from '../middleware/auth.js';
 import { badRequest, forbidden, notFound, stableId } from '../lib/http.js';
 import { publish } from '../realtime/bus.js';
@@ -29,7 +29,7 @@ const registerSchema = z.discriminatedUnion('kind', [
   }),
 ]);
 
-const getDevice = db.prepare('SELECT * FROM devices WHERE id = ?');
+const getDevice = (id: string) => db.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', id);
 
 /**
  * POST /v1/devices/register
@@ -55,16 +55,15 @@ devicesRouter.post('/register', async (c) => {
     id = stableId('mob', user.id, body.installationId);
   }
 
-  const existing = getDevice.get(id) as unknown as DeviceRow | undefined;
+  const existing = await getDevice(id);
   if (existing?.revoked_at) throw forbidden('This device was revoked. Reset the device identity to register again.', 'DEVICE_REVOKED');
 
-  db.prepare(`
-    INSERT INTO devices (id, user_id, kind, name, platform, app_version, public_key, push_token, last_seen_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET name = excluded.name, platform = excluded.platform,
-      app_version = excluded.app_version, push_token = COALESCE(excluded.push_token, devices.push_token),
-      last_seen_at = excluded.last_seen_at
-  `).run(
+  await db.run(
+    `INSERT INTO devices (id, user_id, kind, name, platform, app_version, public_key, push_token, last_seen_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET name = excluded.name, platform = excluded.platform,
+       app_version = excluded.app_version, push_token = COALESCE(excluded.push_token, devices.push_token),
+       last_seen_at = excluded.last_seen_at`,
     id,
     user.id,
     body.kind,
@@ -77,80 +76,75 @@ devicesRouter.post('/register', async (c) => {
     ts,
   );
 
-  const device = getDevice.get(id) as unknown as DeviceRow;
-  if (!existing) publish({ userId: user.id, deviceId: id, type: 'device.registered', payload: serializeDevice(device) });
-  return c.json({ data: serializeDevice(device) }, existing ? 200 : 201);
+  const device = await serializeDevice((await getDevice(id))!);
+  if (!existing) await publish({ userId: user.id, deviceId: id, type: 'device.registered', payload: device });
+  return c.json({ data: device }, existing ? 200 : 201);
 });
 
 // GET /v1/devices
-devicesRouter.get('/', (c) => {
-  const user = c.get('user');
-  const rows = db
-    .prepare('SELECT * FROM devices WHERE user_id = ? AND revoked_at IS NULL ORDER BY kind, created_at')
-    .all(user.id) as unknown as DeviceRow[];
-  return c.json({ data: rows.map(serializeDevice) });
+devicesRouter.get('/', async (c) => {
+  const rows = await db.all<DeviceRow>('SELECT * FROM devices WHERE user_id = ? AND revoked_at IS NULL ORDER BY kind, created_at', c.get('user').id);
+  return c.json({ data: await Promise.all(rows.map(serializeDevice)) });
 });
 
-function ownedDevice(userId: string, id: string): DeviceRow {
-  const row = getDevice.get(id) as unknown as DeviceRow | undefined;
+async function ownedDevice(userId: string, id: string): Promise<DeviceRow> {
+  const row = await getDevice(id);
   if (!row || row.user_id !== userId) throw notFound('Device');
   return row;
 }
 
 // GET /v1/devices/:id
-devicesRouter.get('/:id', (c) => {
-  return c.json({ data: serializeDevice(ownedDevice(c.get('user').id, c.req.param('id'))) });
+devicesRouter.get('/:id', async (c) => {
+  return c.json({ data: await serializeDevice(await ownedDevice(c.get('user').id, c.req.param('id'))) });
 });
 
 // PATCH /v1/devices/:id  { name?, pushToken? }
 devicesRouter.patch('/:id', async (c) => {
   const user = c.get('user');
-  const device = ownedDevice(user.id, c.req.param('id'));
+  const device = await ownedDevice(user.id, c.req.param('id'));
   const body = z.object({ name: z.string().min(1).max(100).optional(), pushToken: z.string().max(4096).optional() }).parse(await c.req.json());
-  db.prepare('UPDATE devices SET name = COALESCE(?, name), push_token = COALESCE(?, push_token) WHERE id = ?').run(
-    body.name ?? null,
-    body.pushToken ?? null,
-    device.id,
-  );
-  const updated = getDevice.get(device.id) as unknown as DeviceRow;
-  publish({ userId: user.id, deviceId: device.id, type: 'device.updated', payload: serializeDevice(updated) });
-  return c.json({ data: serializeDevice(updated) });
+  await db.run('UPDATE devices SET name = COALESCE(?, name), push_token = COALESCE(?, push_token) WHERE id = ?', body.name ?? null, body.pushToken ?? null, device.id);
+  const updated = await serializeDevice((await getDevice(device.id))!);
+  await publish({ userId: user.id, deviceId: device.id, type: 'device.updated', payload: updated });
+  return c.json({ data: updated });
 });
 
 // POST /v1/devices/:id/revoke — permanently revoke a device and remove its links
-devicesRouter.post('/:id/revoke', (c) => {
+devicesRouter.post('/:id/revoke', async (c) => {
   const user = c.get('user');
-  const device = ownedDevice(user.id, c.req.param('id'));
-  tx(() => {
-    db.prepare('UPDATE devices SET revoked_at = ? WHERE id = ?').run(now(), device.id);
-    db.prepare('DELETE FROM device_links WHERE desktop_id = ? OR mobile_id = ?').run(device.id, device.id);
-    db.prepare("UPDATE commands SET status = 'FAILED', error = 'Device revoked', updated_at = ? WHERE device_id = ? AND status = 'PENDING'").run(now(), device.id);
+  const device = await ownedDevice(user.id, c.req.param('id'));
+  await db.tx(async (q) => {
+    await q.run('UPDATE devices SET revoked_at = ? WHERE id = ?', now(), device.id);
+    await q.run('DELETE FROM device_links WHERE desktop_id = ? OR mobile_id = ?', device.id, device.id);
+    await q.run("UPDATE commands SET status = 'FAILED', error = 'Device revoked', updated_at = ? WHERE device_id = ? AND status = 'PENDING'", now(), device.id);
   });
-  publish({ userId: user.id, deviceId: device.id, type: 'device.revoked', payload: { id: device.id } });
+  await publish({ userId: user.id, deviceId: device.id, type: 'device.revoked', payload: { id: device.id } });
   return c.json({ data: { id: device.id, revoked: true } });
 });
 
 // POST /v1/devices/:id/unlink { otherDeviceId } — disconnect a phone from a desktop
 devicesRouter.post('/:id/unlink', async (c) => {
   const user = c.get('user');
-  const device = ownedDevice(user.id, c.req.param('id'));
+  const device = await ownedDevice(user.id, c.req.param('id'));
   const { otherDeviceId } = z.object({ otherDeviceId: z.string() }).parse(await c.req.json());
-  ownedDevice(user.id, otherDeviceId);
-  const result = db
-    .prepare('DELETE FROM device_links WHERE (desktop_id = ? AND mobile_id = ?) OR (desktop_id = ? AND mobile_id = ?)')
-    .run(device.id, otherDeviceId, otherDeviceId, device.id);
+  await ownedDevice(user.id, otherDeviceId);
+  const result = await db.run(
+    'DELETE FROM device_links WHERE (desktop_id = ? AND mobile_id = ?) OR (desktop_id = ? AND mobile_id = ?)',
+    device.id,
+    otherDeviceId,
+    otherDeviceId,
+    device.id,
+  );
   if (result.changes === 0) throw notFound('Device link');
-  publish({ userId: user.id, deviceId: device.id, type: 'device.unlinked', payload: { a: device.id, b: otherDeviceId } });
+  await publish({ userId: user.id, deviceId: device.id, type: 'device.unlinked', payload: { a: device.id, b: otherDeviceId } });
   return c.json({ data: { unlinked: true } });
 });
 
 // GET /v1/devices/:id/commands — pending commands for the calling desktop (signed)
-devicesRouter.get('/:id/commands', requireDevice('desktop'), (c) => {
+devicesRouter.get('/:id/commands', requireDevice('desktop'), async (c) => {
   const device = c.get('device')!;
   if (device.id !== c.req.param('id')) throw forbidden('Devices can only read their own commands');
-  expireStaleCommands(device.id);
-  const rows = db
-    .prepare(`${COMMAND_SELECT} WHERE c.device_id = ? AND c.status = 'PENDING' ORDER BY c.created_at ASC LIMIT 100`)
-    .all(device.id) as any[];
+  await expireStaleCommands(device.id);
+  const rows = await db.all(`${COMMAND_SELECT} WHERE c.device_id = ? AND c.status = 'PENDING' ORDER BY c.created_at ASC LIMIT 100`, device.id);
   return c.json({ data: rows.map(serializeCommand) });
 });

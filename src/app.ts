@@ -37,10 +37,10 @@ app.use(
 app.onError(errorHandler);
 
 app.get('/health', (c) => c.json({ status: 'ok', service: 'bambookit-api', version: VERSION, timestamp: new Date().toISOString() }));
-app.get('/ready', (c) => {
+app.get('/ready', async (c) => {
   try {
-    db.prepare('SELECT 1').get();
-    return c.json({ status: 'ready', database: 'ok' });
+    await db.ping();
+    return c.json({ status: 'ready', database: db.dialect });
   } catch (err: any) {
     return c.json({ status: 'not_ready', database: err.message }, 503);
   }

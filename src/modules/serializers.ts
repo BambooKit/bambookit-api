@@ -2,16 +2,16 @@ import { db, parseJson } from '../db/database.js';
 import { isConnected } from '../realtime/bus.js';
 import type { DeviceRow } from '../middleware/auth.js';
 
-const linksForDevice = db.prepare(`
+const LINKS_FOR_DEVICE = `
   SELECT d.id, d.name, d.kind, d.platform FROM device_links l
   JOIN devices d ON d.id = CASE WHEN l.desktop_id = ? THEN l.mobile_id ELSE l.desktop_id END
   WHERE (l.desktop_id = ? OR l.mobile_id = ?) AND d.revoked_at IS NULL
-`);
-const activeSessionForDevice = db.prepare(`
+`;
+const ACTIVE_SESSION_FOR_DEVICE = `
   SELECT s.id, s.title, s.status, p.name AS project_name FROM sessions s
   LEFT JOIN projects p ON p.id = s.project_id
-  WHERE s.device_id = ? ORDER BY (s.status IN ('busy','retry')) DESC, s.updated_at DESC LIMIT 1
-`);
+  WHERE s.device_id = ? ORDER BY CASE WHEN s.status IN ('busy','retry') THEN 0 ELSE 1 END, s.updated_at DESC LIMIT 1
+`;
 
 export function isDeviceOnline(row: DeviceRow): boolean {
   if (row.revoked_at) return false;
@@ -19,9 +19,9 @@ export function isDeviceOnline(row: DeviceRow): boolean {
   return !!row.last_seen_at && Date.now() - Date.parse(row.last_seen_at) < 120_000;
 }
 
-export function serializeDevice(row: DeviceRow) {
-  const links = linksForDevice.all(row.id, row.id, row.id) as any[];
-  const active = row.kind === 'desktop' ? (activeSessionForDevice.get(row.id) as any) : undefined;
+export async function serializeDevice(row: DeviceRow) {
+  const links = await db.all(LINKS_FOR_DEVICE, row.id, row.id, row.id);
+  const active = row.kind === 'desktop' ? await db.get(ACTIVE_SESSION_FOR_DEVICE, row.id) : undefined;
   return {
     id: row.id,
     kind: row.kind,
@@ -48,8 +48,8 @@ export function serializeProject(row: any) {
     name: row.name,
     directory: row.directory,
     branch: row.branch,
-    activeSessions: row.active_sessions ?? 0,
-    totalSessions: row.total_sessions ?? 0,
+    activeSessions: Number(row.active_sessions ?? 0),
+    totalSessions: Number(row.total_sessions ?? 0),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -70,8 +70,8 @@ export function serializeSession(row: any) {
     agent: row.agent,
     model: row.model,
     currentAction: row.current_action,
-    changes: { additions: row.additions, deletions: row.deletions, files: row.files },
-    pendingApprovals: row.pending_approvals ?? 0,
+    changes: { additions: Number(row.additions), deletions: Number(row.deletions), files: Number(row.files) },
+    pendingApprovals: Number(row.pending_approvals ?? 0),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -131,8 +131,8 @@ export function serializeCommand(row: any) {
 export const COMMAND_SELECT = `
   SELECT c.*, s.opencode_session_id, s.directory FROM commands c LEFT JOIN sessions s ON s.id = c.session_id`;
 
-export function commandRow(id: string): any {
-  return db.prepare(`${COMMAND_SELECT} WHERE c.id = ?`).get(id);
+export function commandRow(id: string): Promise<any> {
+  return db.get(`${COMMAND_SELECT} WHERE c.id = ?`, id);
 }
 
 export function serializeNotification(row: any) {

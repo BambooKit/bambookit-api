@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { env } from '../config/env.js';
-import { db, now, tx } from '../db/database.js';
+import { db, now } from '../db/database.js';
 import { HttpError, notFound, sha256 } from '../lib/http.js';
 import { renderSharePage } from './share-page.js';
 
@@ -18,23 +18,7 @@ import { renderSharePage } from './share-page.js';
  *   GET    /share/:id                                          -> HTML viewer (public)
  * Only the holder of the per-share secret (the publishing desktop) can change or delete a share.
  */
-db.exec(`
-CREATE TABLE IF NOT EXISTS shares (
-  id TEXT PRIMARY KEY,
-  secret_hash TEXT NOT NULL,
-  opencode_session_id TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS share_items (
-  share_id TEXT NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
-  key TEXT NOT NULL,
-  type TEXT NOT NULL,
-  data TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (share_id, key)
-);
-`);
+// Tables: shares, share_items (see db/database.ts).
 
 const MAX_SYNC_BYTES = 4 * 1024 * 1024;
 const MAX_ITEMS_PER_SHARE = 20_000;
@@ -74,16 +58,16 @@ function shareUrl(c: any, id: string) {
   return `${base}/share/${id}`;
 }
 
-function checkSecret(id: string, secret: unknown) {
-  const row = db.prepare('SELECT secret_hash FROM shares WHERE id = ?').get(id) as { secret_hash: string } | undefined;
+async function checkSecret(id: string, secret: unknown) {
+  const row = await db.get<{ secret_hash: string }>('SELECT secret_hash FROM shares WHERE id = ?', id);
   if (!row) throw notFound('Share');
   const given = Buffer.from(sha256(String(secret ?? '')), 'hex');
   const expected = Buffer.from(row.secret_hash, 'hex');
   if (given.length !== expected.length || !timingSafeEqual(given, expected)) throw new HttpError(403, 'FORBIDDEN', 'Invalid share secret');
 }
 
-export function shareItems(id: string): Array<{ type: string; data: any }> {
-  return (db.prepare('SELECT type, data FROM share_items WHERE share_id = ? ORDER BY key').all(id) as any[]).map((r) => ({ type: r.type, data: JSON.parse(r.data) }));
+export async function shareItems(id: string): Promise<Array<{ type: string; data: any }>> {
+  return (await db.all('SELECT type, data FROM share_items WHERE share_id = ? ORDER BY key', id)).map((r) => ({ type: r.type, data: JSON.parse(r.data) }));
 }
 
 export const sharesRouter = new Hono();
@@ -94,7 +78,7 @@ sharesRouter.post('/api/share', async (c) => {
   const id = randomBytes(6).toString('base64url');
   const secret = randomBytes(32).toString('base64url');
   const ts = now();
-  db.prepare('INSERT INTO shares (id, secret_hash, opencode_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run(id, sha256(secret), sessionID, ts, ts);
+  await db.run('INSERT INTO shares (id, secret_hash, opencode_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', id, sha256(secret), sessionID, ts, ts);
   return c.json({ id, secret, url: shareUrl(c, id) });
 });
 
@@ -103,15 +87,15 @@ sharesRouter.post('/api/share/:id/sync', async (c) => {
   if (raw.length > MAX_SYNC_BYTES) throw new HttpError(422, 'TOO_LARGE', 'Share update too large');
   const body = z.object({ secret: z.string(), data: z.array(itemSchema).max(5000) }).parse(JSON.parse(raw));
   const id = c.req.param('id');
-  checkSecret(id, body.secret);
-  tx(() => {
-    const count = Number((db.prepare('SELECT COUNT(*) AS n FROM share_items WHERE share_id = ?').get(id) as any).n);
+  await checkSecret(id, body.secret);
+  await db.tx(async (q) => {
+    const count = Number((await q.get('SELECT COUNT(*) AS n FROM share_items WHERE share_id = ?', id))?.n ?? 0);
     if (count + body.data.length > MAX_ITEMS_PER_SHARE) throw new HttpError(422, 'TOO_LARGE', 'Share has too many items');
     const ts = now();
-    const upsert = db.prepare(`INSERT INTO share_items (share_id, key, type, data, updated_at) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(share_id, key) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`);
-    for (const item of body.data) upsert.run(id, keyOf(item), item.type, JSON.stringify(item.data ?? null), ts);
-    db.prepare('UPDATE shares SET updated_at = ? WHERE id = ?').run(ts, id);
+    const UPSERT = `INSERT INTO share_items (share_id, key, type, data, updated_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(share_id, key) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`;
+    for (const item of body.data) await q.run(UPSERT, id, keyOf(item), item.type, JSON.stringify(item.data ?? null), ts);
+    await q.run('UPDATE shares SET updated_at = ? WHERE id = ?', ts, id);
   });
   return c.json({});
 });
@@ -119,26 +103,26 @@ sharesRouter.post('/api/share/:id/sync', async (c) => {
 sharesRouter.delete('/api/share/:id', async (c) => {
   const body = z.object({ secret: z.string() }).parse(await c.req.json().catch(() => ({})));
   const id = c.req.param('id');
-  checkSecret(id, body.secret);
-  tx(() => {
-    db.prepare('DELETE FROM share_items WHERE share_id = ?').run(id);
-    db.prepare('DELETE FROM shares WHERE id = ?').run(id);
+  await checkSecret(id, body.secret);
+  await db.tx(async (q) => {
+    await q.run('DELETE FROM share_items WHERE share_id = ?', id);
+    await q.run('DELETE FROM shares WHERE id = ?', id);
   });
   return c.json({});
 });
 
-sharesRouter.get('/api/share/:id/data', (c) => {
+sharesRouter.get('/api/share/:id/data', async (c) => {
   const id = c.req.param('id');
-  if (!db.prepare('SELECT 1 FROM shares WHERE id = ?').get(id)) throw notFound('Share');
+  if (!(await db.get('SELECT 1 AS ok FROM shares WHERE id = ?', id))) throw notFound('Share');
   c.header('Cache-Control', 'no-store');
-  return c.json(shareItems(id));
+  return c.json(await shareItems(id));
 });
 
-sharesRouter.get('/share/:id', (c) => {
+sharesRouter.get('/share/:id', async (c) => {
   const id = c.req.param('id');
-  const share = db.prepare('SELECT * FROM shares WHERE id = ?').get(id) as any;
+  const share = await db.get('SELECT * FROM shares WHERE id = ?', id);
   if (!share) return c.html(renderSharePage(null, []), 404);
   c.header('Cache-Control', 'no-store');
   c.header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'");
-  return c.html(renderSharePage(share, shareItems(id)));
+  return c.html(renderSharePage(share, await shareItems(id)));
 });
