@@ -325,3 +325,30 @@ describe('session sharing', () => {
     expect((await call('GET', `/api/share/${id}/data`)).status).toBe(404);
   });
 });
+
+describe('transcripts and new commands', () => {
+  it('replaces a transcript and accepts rewind/share/file commands', async () => {
+    const token = await tokenFor('user-tr-1', 'tr@example.com');
+    const desktop = await setupDesktop(token);
+    const part = (id: string, text: string) => ({ opencodeSessionId: 'ses_tr', messageId: 'msg_' + id, partId: 'prt_' + id, role: 'user', type: 'text', text, sortKey: id });
+    await call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { sessions: [{ opencodeSessionId: 'ses_tr', directory: 'C:\tr', title: 'TR', status: 'idle' }], parts: [part('1', 'one'), part('2', 'two')] } });
+    const session = (await call('GET', '/v1/sessions', { token })).json.data[0];
+    expect((await call('GET', `/v1/sessions/${session.id}/parts`, { token })).json.data).toHaveLength(2);
+
+    // After a rewind the desktop sends the remaining transcript; later parts disappear.
+    await call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { transcripts: [{ opencodeSessionId: 'ses_tr', parts: [part('1', 'one')] }] } });
+    const parts = (await call('GET', `/v1/sessions/${session.id}/parts`, { token })).json.data;
+    expect(parts.map((p: any) => p.text)).toEqual(['one']);
+
+    for (const [type, payload] of [
+      ['REVERT', { messageId: 'msg_1' }],
+      ['UNREVERT', {}],
+      ['SHARE', {}],
+      ['READ_FILE', { path: 'src/a.ts' }],
+      ['WRITE_FILE', { path: 'src/a.ts', content: 'x', baseSha256: null }],
+    ] as const) {
+      expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type, payload } })).status).toBe(202);
+    }
+    expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'REVERT', payload: {} } })).status).toBe(400);
+  });
+});

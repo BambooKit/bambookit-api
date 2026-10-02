@@ -18,6 +18,19 @@ syncRouter.use('*', requireUser, requireDevice('desktop'));
 const MAX_TEXT = 20_000;
 const status = z.enum(['idle', 'busy', 'retry', 'error']);
 
+const partSchema = z.object({
+  opencodeSessionId: z.string().max(200),
+  messageId: z.string().max(200),
+  partId: z.string().max(200),
+  role: z.enum(['user', 'assistant']),
+  type: z.enum(['text', 'reasoning', 'tool']),
+  text: z.string().nullish(),
+  tool: z.string().max(100).nullish(),
+  toolStatus: z.string().max(40).nullish(),
+  toolTitle: z.string().max(500).nullish(),
+  sortKey: z.string().max(100),
+});
+
 const syncSchema = z.object({
   projects: z
     .array(z.object({ opencodeProjectId: z.string().min(1), name: z.string().min(1).max(200), directory: z.string().min(1).max(1000), branch: z.string().max(200).nullish() }))
@@ -45,23 +58,9 @@ const syncSchema = z.object({
     .max(500)
     .optional(),
   removedSessions: z.array(z.string().max(200)).max(500).optional(),
-  parts: z
-    .array(
-      z.object({
-        opencodeSessionId: z.string().max(200),
-        messageId: z.string().max(200),
-        partId: z.string().max(200),
-        role: z.enum(['user', 'assistant']),
-        type: z.enum(['text', 'reasoning', 'tool']),
-        text: z.string().nullish(),
-        tool: z.string().max(100).nullish(),
-        toolStatus: z.string().max(40).nullish(),
-        toolTitle: z.string().max(500).nullish(),
-        sortKey: z.string().max(100),
-      }),
-    )
-    .max(500)
-    .optional(),
+  parts: z.array(partSchema).max(500).optional(),
+  // Full transcript of a session, replacing what is stored (used after resync, rewind or deletions).
+  transcripts: z.array(z.object({ opencodeSessionId: z.string().max(200), parts: z.array(partSchema).max(2000) })).max(5).optional(),
   diffs: z
     .array(
       z.object({
@@ -178,6 +177,21 @@ syncRouter.post('/', async (c) => {
         id, sessionId, p.messageId, p.role, p.type, p.text?.slice(0, MAX_TEXT) ?? null, p.tool ?? null, p.toolStatus ?? null, p.toolTitle ?? null, p.sortKey, ts,
       );
       out.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.part', payload: serializePart(await q.get('SELECT * FROM session_parts WHERE id = ?', id)) });
+    }
+
+    for (const t of body.transcripts ?? []) {
+      const sessionId = sessionIdFor(t.opencodeSessionId);
+      if (!(await ownsSession(sessionId))) continue;
+      await q.run('DELETE FROM session_parts WHERE session_id = ?', sessionId);
+      for (const p of t.parts) {
+        await q.run(
+          `INSERT INTO session_parts (id, session_id, message_id, role, type, text, tool, tool_status, tool_title, sort_key, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+          stableId('prt', sessionId, p.partId), sessionId, p.messageId, p.role, p.type, p.text?.slice(0, MAX_TEXT) ?? null,
+          p.tool ?? null, p.toolStatus ?? null, p.toolTitle ?? null, p.sortKey, ts,
+        );
+      }
+      out.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.transcript', payload: { sessionId, parts: t.parts.length } });
     }
 
     for (const d of body.diffs ?? []) {
