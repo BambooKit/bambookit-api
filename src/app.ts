@@ -37,7 +37,8 @@ app.use(
 
 app.onError(errorHandler);
 
-app.get('/health', (c) => c.json({ status: 'ok', service: 'bambookit-api', version: VERSION, timestamp: new Date().toISOString() }));
+const COMMIT = process.env.RENDER_GIT_COMMIT?.slice(0, 7) ?? null;
+app.get('/health', (c) => c.json({ status: 'ok', service: 'bambookit-api', version: VERSION, commit: COMMIT, timestamp: new Date().toISOString() }));
 app.get('/ready', async (c) => {
   try {
     await db.ping();
