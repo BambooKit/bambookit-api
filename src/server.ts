@@ -10,6 +10,7 @@ logger.info(`Starting BambooKit API v${VERSION}`, {
   supabase: env.SUPABASE_URL,
 });
 
-serve({ fetch: app.fetch, port: env.PORT, hostname: '0.0.0.0' }, (info) => {
+// '::' listens on IPv6 and IPv4 (dual stack), so both localhost and 127.0.0.1 work.
+serve({ fetch: app.fetch, port: env.PORT, hostname: '::' }, (info) => {
   logger.info(`BambooKit API listening on http://localhost:${info.port}`);
 });
