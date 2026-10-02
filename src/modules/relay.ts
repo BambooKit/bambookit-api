@@ -14,7 +14,7 @@ export const RELAY_TIMEOUT_MS = 20_000;
 type Pending = { userId: string; deviceId: string; resolve: (data: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout };
 const pending = new Map<string, Pending>();
 
-export type RelayKind = 'transcript' | 'changes';
+export type RelayKind = 'transcript' | 'changes' | 'filemap' | 'diagram';
 
 export async function relay(userId: string, desktop: DeviceRow, kind: RelayKind, params: Record<string, unknown>): Promise<unknown> {
   if (!isConnected(desktop.id)) throw new HttpError(503, 'DESKTOP_OFFLINE', `${desktop.name} is offline. Session chats are stored on that PC; open BambooKit Desktop there to see them.`);

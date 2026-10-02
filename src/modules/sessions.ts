@@ -97,6 +97,21 @@ const userCommandTypes = [
   'SEND_MESSAGE', 'ABORT', 'CONTINUE', 'RETRY', 'GET_DIFF', 'REFRESH',
   'REVERT', 'UNREVERT', 'SHARE', 'UNSHARE', 'READ_FILE', 'WRITE_FILE',
 ] as const;
+// GET /v1/sessions/:id/filemap — every file the session read, created, edited or deleted (live from the PC)
+sessionsRouter.get('/:id/filemap', async (c) => {
+  const user = c.get('user');
+  const session = await ownedSession(user.id, c.req.param('id'));
+  const res = (await relay(user.id, await sessionDesktop(session), 'filemap', { opencodeSessionId: session.opencode_session_id })) as { files?: unknown[] } | null;
+  return c.json({ data: res?.files ?? [] });
+});
+
+// GET /v1/sessions/:id/diagram — the session's project drawn as components and real references (live from the PC)
+sessionsRouter.get('/:id/diagram', async (c) => {
+  const user = c.get('user');
+  const session = await ownedSession(user.id, c.req.param('id'));
+  return c.json({ data: await relay(user.id, await sessionDesktop(session), 'diagram', { opencodeSessionId: session.opencode_session_id }) });
+});
+
 // Commands that continue or change the conversation need the session to be continued on the PC first.
 const continueCommands = new Set(['SEND_MESSAGE', 'CONTINUE', 'RETRY', 'REVERT', 'UNREVERT', 'WRITE_FILE']);
 
