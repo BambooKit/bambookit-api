@@ -49,4 +49,4 @@ function parseEnv(): Env {
 export const env = parseEnv();
 
 
-export const VERSION = '0.2.0';
+export const VERSION = '1.0.1';

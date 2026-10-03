@@ -1,6 +1,6 @@
 {
   "name": "bambookit-api",
-  "version": "0.2.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "BambooKit control plane: auth, devices, QR pairing, session registry, remote commands, approvals, realtime",
