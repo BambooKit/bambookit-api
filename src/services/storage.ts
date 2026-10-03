@@ -116,6 +116,9 @@ function createStore(): ObjectStore | null {
     region: 'auto',
     endpoint,
     credentials: { accessKeyId: env.R2_ACCESS_KEY_ID, secretAccessKey: env.R2_SECRET_ACCESS_KEY },
+    // Otherwise the SDK signs a checksum of an empty body into presigned upload URLs and R2 rejects the real upload (403).
+    requestChecksumCalculation: 'WHEN_REQUIRED',
+    responseChecksumValidation: 'WHEN_REQUIRED',
   });
   return new R2Store(s3, env.R2_BUCKET_NAME);
 }
