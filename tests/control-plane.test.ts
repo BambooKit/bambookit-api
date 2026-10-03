@@ -390,10 +390,11 @@ describe('sessions continue on the PC first', () => {
       ['SEND_MESSAGE', { text: 'continue' }],
       ['REVERT', { messageId: 'msg_1' }],
       ['UNREVERT', {}],
-      ['WRITE_FILE', { path: 'src/a.ts', content: 'x', baseSha256: null }],
     ] as const) {
       expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type, payload } })).status).toBe(202);
     }
+    // Files are view-only remotely.
+    expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'WRITE_FILE', payload: { path: 'src/a.ts', content: 'x', baseSha256: null } } })).status).toBe(400);
     expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'REVERT', payload: {} } })).status).toBe(400);
 
     const project = (await call('GET', '/v1/projects', { token })).json.data[0];

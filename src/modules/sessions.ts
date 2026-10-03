@@ -95,7 +95,8 @@ sessionsRouter.get('/:id/changes', async (c) => {
 // POST /v1/sessions/:id/commands { type, payload }
 const userCommandTypes = [
   'SEND_MESSAGE', 'ABORT', 'CONTINUE', 'RETRY', 'GET_DIFF', 'REFRESH',
-  'REVERT', 'UNREVERT', 'SHARE', 'UNSHARE', 'READ_FILE', 'WRITE_FILE',
+  // Project files are view-only from phones and the website (READ_FILE, /tree, /file); no remote edits.
+  'REVERT', 'UNREVERT', 'SHARE', 'UNSHARE', 'READ_FILE',
 ] as const;
 // GET /v1/sessions/:id/filemap — every file the session read, created, edited or deleted (live from the PC)
 sessionsRouter.get('/:id/filemap', async (c) => {
@@ -129,7 +130,7 @@ sessionsRouter.get('/:id/file', async (c) => {
 });
 
 // Commands that continue or change the conversation need the session to be continued on the PC first.
-const continueCommands = new Set(['SEND_MESSAGE', 'CONTINUE', 'RETRY', 'REVERT', 'UNREVERT', 'WRITE_FILE']);
+const continueCommands = new Set(['SEND_MESSAGE', 'CONTINUE', 'RETRY', 'REVERT', 'UNREVERT']);
 
 sessionsRouter.post('/:id/commands', async (c) => {
   const user = c.get('user');
