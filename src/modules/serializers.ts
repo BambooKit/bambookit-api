@@ -74,6 +74,7 @@ export function serializeSession(row: any) {
     currentAction: row.current_action,
     // Phones may chat in this session only after it was continued on the PC.
     remote: Boolean(Number(row.remote ?? 0)),
+    starred: Boolean(Number(row.starred ?? 0)),
     changes: { additions: Number(row.additions), deletions: Number(row.deletions), files: Number(row.files) },
     pendingApprovals: Number(row.pending_approvals ?? 0),
     createdAt: row.created_at,

@@ -624,3 +624,30 @@ describe('agent questions, continue on PC and nicknames', () => {
     expect((await call('PATCH', '/v1/me', { token, body: { name: '' } })).json.data.name).toBe('nick');
   });
 });
+
+describe('liking and renaming sessions', () => {
+  it('stars a session for this account only and sends renames to the PC', async () => {
+    const token = await tokenFor('user-st-1', 'st@example.com');
+    const desktop = await setupDesktop(token);
+    const sync = () => call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { sessions: [{ opencodeSessionId: 'ses_st', directory: 'C:\st', title: 'Old', status: 'idle' }] } });
+    await sync();
+    const session = (await call('GET', '/v1/sessions', { token })).json.data[0];
+    expect(session.starred).toBe(false);
+
+    const liked = await call('PATCH', `/v1/sessions/${session.id}`, { token, body: { starred: true } });
+    expect(liked.status).toBe(200);
+    expect(liked.json.data.starred).toBe(true);
+    await sync(); // the PC's next sync does not undo it
+    expect((await call('GET', '/v1/sessions?starred=true', { token })).json.data.map((s: any) => s.id)).toEqual([session.id]);
+    expect((await call('PATCH', `/v1/sessions/${session.id}`, { token, body: { title: 'x' } })).status).toBe(400);
+
+    const other = await tokenFor('user-st-2', 'st2@example.com');
+    expect((await call('PATCH', `/v1/sessions/${session.id}`, { token: other, body: { starred: true } })).status).toBe(404);
+
+    // Renaming works without continuing the session; the PC changes the title.
+    const rename = await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'RENAME_SESSION', payload: { title: '  New name ' } } });
+    expect(rename.status).toBe(202);
+    expect(rename.json.data.payload).toEqual({ title: 'New name' });
+    expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'RENAME_SESSION', payload: { title: '' } } })).status).toBe(400);
+  });
+});

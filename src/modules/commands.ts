@@ -24,6 +24,8 @@ export const commandPayloads = {
   QUESTION_REJECT: z.object({ requestId: z.string() }),
   // Open the session in BambooKit on the PC; after that, phones may chat in it.
   CONTINUE_ON_PC: z.object({}).strict(),
+  // Rename the session on the PC (the engine owns the title; the index updates on the next sync).
+  RENAME_SESSION: z.object({ title: z.string().trim().min(1).max(200) }),
   CREATE_SESSION: z.object({ directory: z.string().min(1).max(1000), text: z.string().min(1).max(20_000) }),
   // Rewind the conversation (and, where the engine has snapshots, the files) to before a message.
   REVERT: z.object({ messageId: z.string().min(1).max(200) }),

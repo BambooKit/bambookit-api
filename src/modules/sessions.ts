@@ -6,6 +6,7 @@ import { HttpError, badRequest, forbidden, notFound } from '../lib/http.js';
 import { commandPayloads, createCommand, resolveIssuer, type CommandType } from './commands.js';
 import { serializeProject, serializeSession } from './serializers.js';
 import { relay } from './relay.js';
+import { publish } from '../realtime/bus.js';
 import { partView, type PartSync } from './sync.js';
 
 const SESSION_SELECT = `
@@ -60,6 +61,7 @@ sessionsRouter.get('/', async (c) => {
   if (projectId) (where.push('s.project_id = ?'), args.push(projectId));
   if (deviceId) (where.push('s.device_id = ?'), args.push(deviceId));
   if (c.req.query('active') === 'true') where.push("s.status IN ('busy','retry')");
+  if (c.req.query('starred') === 'true') where.push('s.starred = 1');
   if (c.req.query('includeChildren') !== 'true') where.push('s.parent_opencode_session_id IS NULL');
   const rows = await db.all(`${SESSION_SELECT} WHERE ${where.join(' AND ')} ORDER BY s.updated_at DESC LIMIT 200`, ...args);
   return c.json({ data: rows.map(serializeSession) });
@@ -67,6 +69,17 @@ sessionsRouter.get('/', async (c) => {
 
 sessionsRouter.get('/:id', async (c) => {
   return c.json({ data: serializeSession(await ownedSession(c.get('user').id, c.req.param('id'))) });
+});
+
+// PATCH /v1/sessions/:id { starred } — like / unlike a session (kept by BambooKit only)
+sessionsRouter.patch('/:id', async (c) => {
+  const user = c.get('user');
+  const session = await ownedSession(user.id, c.req.param('id'));
+  const { starred } = z.object({ starred: z.boolean() }).strict().parse(await c.req.json());
+  await db.run('UPDATE sessions SET starred = ? WHERE id = ?', starred ? 1 : 0, session.id);
+  const updated = serializeSession(await ownedSession(user.id, session.id));
+  await publish({ userId: user.id, deviceId: session.device_id, projectId: session.project_id, sessionId: session.id, type: 'session.updated', payload: updated });
+  return c.json({ data: updated });
 });
 
 async function sessionDesktop(session: any) {
@@ -96,7 +109,7 @@ sessionsRouter.get('/:id/changes', async (c) => {
 const userCommandTypes = [
   'SEND_MESSAGE', 'ABORT', 'CONTINUE', 'RETRY', 'GET_DIFF', 'REFRESH',
   // Project files are view-only from phones and the website (READ_FILE, /tree, /file); no remote edits.
-  'REVERT', 'UNREVERT', 'SHARE', 'UNSHARE', 'READ_FILE', 'CONTINUE_ON_PC',
+  'REVERT', 'UNREVERT', 'SHARE', 'UNSHARE', 'READ_FILE', 'CONTINUE_ON_PC', 'RENAME_SESSION',
 ] as const;
 // GET /v1/sessions/:id/filemap — every file the session read, created, edited or deleted (live from the PC)
 sessionsRouter.get('/:id/filemap', async (c) => {
