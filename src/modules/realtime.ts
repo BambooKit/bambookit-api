@@ -8,11 +8,14 @@ import { expireStaleCommands } from './commands.js';
 
 export const realtimeRouter = new Hono<AppEnv>();
 
+const ACCOUNT_EVENTS = new Set(['profile.updated', 'account.deleted']);
 const DESKTOP_EVENTS = new Set(['command.created', 'relay.request', 'pairing.completed', 'device.revoked', 'device.unlinked', 'device.updated']);
 
 /** Which events a stream receives. Desktops only get what they must act on. */
 function visibleTo(device: DeviceRow | null, event: BambooEvent): boolean {
   if (!device || device.kind === 'mobile') return event.type !== 'relay.request';
+  // Account-wide changes every PC shows (profile name/photo) or must react to (account deleted).
+  if (ACCOUNT_EVENTS.has(event.type)) return true;
   if (!DESKTOP_EVENTS.has(event.type)) return false;
   return event.deviceId === device.id || event.type === 'device.unlinked';
 }

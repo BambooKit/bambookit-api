@@ -10,6 +10,9 @@ import { emitEphemeral, isConnected } from '../realtime/bus.js';
  * to the caller. Nothing passing through here is written to the database.
  */
 export const RELAY_TIMEOUT_MS = 20_000;
+/** Whole-project walks (diagram, folder tree) can take longer on large repositories. */
+export const RELAY_SLOW_TIMEOUT_MS = 60_000;
+const SLOW_KINDS = new Set<RelayKind>(['diagram', 'tree']);
 
 type Pending = { userId: string; deviceId: string; resolve: (data: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout };
 const pending = new Map<string, Pending>();
@@ -23,7 +26,7 @@ export async function relay(userId: string, desktop: DeviceRow, kind: RelayKind,
     const timer = setTimeout(() => {
       pending.delete(id);
       reject(new HttpError(503, 'DESKTOP_TIMEOUT', `${desktop.name} did not answer in time. Try again.`));
-    }, RELAY_TIMEOUT_MS);
+    }, SLOW_KINDS.has(kind) ? RELAY_SLOW_TIMEOUT_MS : RELAY_TIMEOUT_MS);
     pending.set(id, { userId, deviceId: desktop.id, resolve, reject, timer });
   });
   emitEphemeral({ userId, deviceId: desktop.id, type: 'relay.request', payload: { id, kind, params } });

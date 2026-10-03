@@ -94,6 +94,9 @@ export function serializeApproval(row: any) {
     patterns: parseJson<string[]>(row.patterns, []),
     status: row.status,
     reply: row.reply,
+    kind: row.kind === 'question' ? 'question' : 'permission',
+    questions: row.questions ? parseJson<unknown[]>(row.questions, []) : null,
+    answers: row.answers ? parseJson<string[][]>(row.answers, []) : null,
     createdAt: row.created_at,
     resolvedAt: row.resolved_at,
   };

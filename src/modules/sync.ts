@@ -85,6 +85,20 @@ const syncSchema = z.object({
         patterns: z.array(z.string().max(1000)).max(50).default([]),
         status: z.enum(['PENDING', 'APPROVED', 'REJECTED']),
         reply: z.string().max(20).nullish(),
+        kind: z.enum(['permission', 'question']).default('permission'),
+        questions: z
+          .array(
+            z.object({
+              header: z.string().max(200).default(''),
+              question: z.string().max(4000),
+              options: z.array(z.object({ label: z.string().max(500), description: z.string().max(2000).default('') })).max(30).default([]),
+              multiple: z.boolean().optional(),
+              custom: z.boolean().optional(),
+            }),
+          )
+          .max(10)
+          .nullish(),
+        answers: z.array(z.array(z.string().max(2000)).max(50)).max(10).nullish(),
       }),
     )
     .max(200)
@@ -213,15 +227,20 @@ syncRouter.post('/', async (c) => {
       const existing = await q.get('SELECT status FROM approvals WHERE id = ?', id);
       if (!existing) {
         await q.run(
-          `INSERT INTO approvals (id, user_id, device_id, session_id, opencode_request_id, permission, title, patterns, status, reply, created_at, resolved_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          id, user.id, device.id, sessionId, a.requestId, a.permission, a.title ?? null, JSON.stringify(a.patterns), a.status, a.reply ?? null, ts, a.status === 'PENDING' ? null : ts,
+          `INSERT INTO approvals (id, user_id, device_id, session_id, opencode_request_id, permission, title, patterns, status, reply, kind, questions, answers, created_at, resolved_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          id, user.id, device.id, sessionId, a.requestId, a.permission, a.title ?? null, JSON.stringify(a.patterns), a.status, a.reply ?? null,
+          a.kind, a.questions ? JSON.stringify(a.questions) : null, a.answers ? JSON.stringify(a.answers) : null, ts, a.status === 'PENDING' ? null : ts,
         );
         if (a.status === 'PENDING') {
-          notes.push({ userId: user.id, type: 'approval.required', title: 'Approval required', body: `${a.permission}${a.title ? `: ${a.title.slice(0, 120)}` : ''}`, data: { approvalId: id, sessionId } });
+          notes.push(
+            a.kind === 'question'
+              ? { userId: user.id, type: 'question.asked', title: 'BambooKit has a question', body: (a.title ?? a.questions?.[0]?.question ?? 'The agent needs your answer').slice(0, 200), data: { approvalId: id, sessionId } }
+              : { userId: user.id, type: 'approval.required', title: 'Approval required', body: `${a.permission}${a.title ? `: ${a.title.slice(0, 120)}` : ''}`, data: { approvalId: id, sessionId } },
+          );
         }
       } else if (a.status !== 'PENDING') {
-        await q.run('UPDATE approvals SET status = ?, reply = ?, resolved_at = ? WHERE id = ?', a.status, a.reply ?? null, ts, id);
+        await q.run('UPDATE approvals SET status = ?, reply = ?, answers = COALESCE(?, answers), resolved_at = ? WHERE id = ?', a.status, a.reply ?? null, a.answers ? JSON.stringify(a.answers) : null, ts, id);
       } else {
         continue;
       }

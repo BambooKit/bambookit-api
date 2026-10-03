@@ -34,31 +34,18 @@ approvalsRouter.get('/:id', async (c) => {
 });
 
 /**
- * POST /v1/approvals/:id/respond { reply: once | always | reject }
- * Forwards the decision to the desktop, which answers OpenCode's own permission request.
- * The approval becomes APPROVED/REJECTED only when the engine confirms it (permission.replied).
+ * Claims a pending approval and forwards the decision to the PC that asked, which answers the engine's own
+ * permission or question request. The approval becomes APPROVED/REJECTED only when the engine confirms it.
  */
-approvalsRouter.post('/:id/respond', async (c) => {
+async function forward(c: any, reply: string, command: { type: 'PERMISSION_REPLY' | 'QUESTION_REPLY' | 'QUESTION_REJECT'; payload: Record<string, unknown> }, approval: any) {
   const user = c.get('user');
-  const { reply } = z.object({ reply: z.enum(['once', 'always', 'reject']) }).parse(await c.req.json());
-  const approval = await db.get(`${APPROVAL_SELECT} WHERE a.id = ? AND a.user_id = ?`, c.req.param('id'), user.id);
-  if (!approval) throw notFound('Approval');
   if (approval.status !== 'PENDING') throw new HttpError(409, 'APPROVAL_NOT_PENDING', `Approval is ${String(approval.status).toLowerCase()}`);
-
   const issuer = await resolveIssuer(user.id, c.req.header('X-BK-Device-Id'));
   const desktop = await db.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', approval.device_id);
   const claimed = await db.run("UPDATE approvals SET status = 'RESPONDING', reply = ? WHERE id = ? AND status = 'PENDING'", reply, approval.id);
   if (claimed.changes !== 1) throw new HttpError(409, 'APPROVAL_NOT_PENDING', 'Approval was already answered');
-
   try {
-    const res = await createCommand({
-      userId: user.id,
-      desktop,
-      sessionId: approval.session_id,
-      issuer,
-      type: 'PERMISSION_REPLY',
-      payload: { requestId: approval.opencode_request_id, reply },
-    });
+    const res = await createCommand({ userId: user.id, desktop, sessionId: approval.session_id, issuer, type: command.type, payload: command.payload });
     const updated = serializeApproval(await db.get(`${APPROVAL_SELECT} WHERE a.id = ?`, approval.id));
     await publish({ userId: user.id, deviceId: approval.device_id, sessionId: approval.session_id, type: 'approval.updated', payload: updated });
     return c.json({ data: updated, command: res.command, deviceOnline: res.deviceOnline }, 202);
@@ -66,4 +53,36 @@ approvalsRouter.post('/:id/respond', async (c) => {
     await db.run("UPDATE approvals SET status = 'PENDING', reply = NULL WHERE id = ?", approval.id);
     throw err;
   }
+}
+
+async function ownedApproval(c: any) {
+  const approval = await db.get(`${APPROVAL_SELECT} WHERE a.id = ? AND a.user_id = ?`, c.req.param('id'), c.get('user').id);
+  if (!approval) throw notFound('Approval');
+  return approval;
+}
+
+/**
+ * POST /v1/approvals/:id/respond { reply: once | always | reject }
+ * For a question, only `reject` (dismiss) is accepted here; answers go to /answer.
+ */
+approvalsRouter.post('/:id/respond', async (c) => {
+  const { reply } = z.object({ reply: z.enum(['once', 'always', 'reject']) }).parse(await c.req.json());
+  const approval = await ownedApproval(c);
+  if (approval.kind === 'question') {
+    if (reply !== 'reject') throw new HttpError(400, 'ANSWER_REQUIRED', 'Answer the question, or dismiss it');
+    return forward(c, 'reject', { type: 'QUESTION_REJECT', payload: { requestId: approval.opencode_request_id } }, approval);
+  }
+  return forward(c, reply, { type: 'PERMISSION_REPLY', payload: { requestId: approval.opencode_request_id, reply } }, approval);
+});
+
+/** POST /v1/approvals/:id/answer { answers: string[][] } — one list of chosen labels (or typed text) per question. */
+approvalsRouter.post('/:id/answer', async (c) => {
+  const { answers } = z
+    .object({ answers: z.array(z.array(z.string().trim().min(1).max(2000)).max(50)).min(1).max(10) })
+    .parse(await c.req.json());
+  const approval = await ownedApproval(c);
+  if (approval.kind !== 'question') throw new HttpError(400, 'NOT_A_QUESTION', 'This request is an approval; use /respond');
+  const questions = JSON.parse(approval.questions ?? '[]') as unknown[];
+  if (questions.length && answers.length !== questions.length) throw new HttpError(400, 'ANSWER_COUNT', `Answer all ${questions.length} questions`);
+  return forward(c, 'answer', { type: 'QUESTION_REPLY', payload: { requestId: approval.opencode_request_id, answers } }, approval);
 });

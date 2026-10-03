@@ -346,6 +346,12 @@ async function migrate(d: Database) {
   await d.run('ALTER TABLE users ADD COLUMN provider TEXT').catch(() => undefined);
   await d.run('ALTER TABLE users ADD COLUMN email_verified INTEGER').catch(() => undefined);
   await d.run('ALTER TABLE users ADD COLUMN avatar_key TEXT').catch(() => undefined);
+  // Nickname chosen in BambooKit; kept apart from the identity provider's name, which is refreshed on sign-in.
+  await d.run('ALTER TABLE users ADD COLUMN nickname TEXT').catch(() => undefined);
+  // Questions the agent asks (kind = 'question') travel through approvals with their options and answers.
+  await d.run("ALTER TABLE approvals ADD COLUMN kind TEXT NOT NULL DEFAULT 'permission'").catch(() => undefined);
+  await d.run('ALTER TABLE approvals ADD COLUMN questions TEXT').catch(() => undefined);
+  await d.run('ALTER TABLE approvals ADD COLUMN answers TEXT').catch(() => undefined);
   // Session chats, diffs and activity now live only on the PC; remove copies stored by earlier versions.
   await d.run('DELETE FROM session_parts');
   await d.run('DELETE FROM session_diffs');

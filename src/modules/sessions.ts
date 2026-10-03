@@ -96,7 +96,7 @@ sessionsRouter.get('/:id/changes', async (c) => {
 const userCommandTypes = [
   'SEND_MESSAGE', 'ABORT', 'CONTINUE', 'RETRY', 'GET_DIFF', 'REFRESH',
   // Project files are view-only from phones and the website (READ_FILE, /tree, /file); no remote edits.
-  'REVERT', 'UNREVERT', 'SHARE', 'UNSHARE', 'READ_FILE',
+  'REVERT', 'UNREVERT', 'SHARE', 'UNSHARE', 'READ_FILE', 'CONTINUE_ON_PC',
 ] as const;
 // GET /v1/sessions/:id/filemap — every file the session read, created, edited or deleted (live from the PC)
 sessionsRouter.get('/:id/filemap', async (c) => {

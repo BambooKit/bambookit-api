@@ -19,6 +19,11 @@ export const commandPayloads = {
   GET_DIFF: z.object({ file: z.string().max(1000).optional() }),
   REFRESH: z.object({}).strict(),
   PERMISSION_REPLY: z.object({ requestId: z.string(), reply: z.enum(['once', 'always', 'reject']) }),
+  // Answer or dismiss a question the agent asked (one list of chosen labels / typed text per question).
+  QUESTION_REPLY: z.object({ requestId: z.string(), answers: z.array(z.array(z.string().max(2000)).max(50)).max(10) }),
+  QUESTION_REJECT: z.object({ requestId: z.string() }),
+  // Open the session in BambooKit on the PC; after that, phones may chat in it.
+  CONTINUE_ON_PC: z.object({}).strict(),
   CREATE_SESSION: z.object({ directory: z.string().min(1).max(1000), text: z.string().min(1).max(20_000) }),
   // Rewind the conversation (and, where the engine has snapshots, the files) to before a message.
   REVERT: z.object({ messageId: z.string().min(1).max(200) }),
@@ -122,10 +127,10 @@ commandsRouter.post('/:id/result', requireDevice('desktop'), async (c) => {
   await db.run('UPDATE commands SET status = ?, result = ?, error = ?, updated_at = ? WHERE id = ?', body.status, result, body.error ?? null, now(), row.id);
   // Session content belongs on the PC: drop message text and file contents from finished commands,
   // and delete command records (including results such as file reads) once they are no longer needed.
-  if (['SEND_MESSAGE', 'WRITE_FILE', 'CREATE_SESSION'].includes(row.type)) await db.run("UPDATE commands SET payload = '{}' WHERE id = ?", row.id);
+  if (['SEND_MESSAGE', 'WRITE_FILE', 'CREATE_SESSION', 'QUESTION_REPLY'].includes(row.type)) await db.run("UPDATE commands SET payload = '{}' WHERE id = ?", row.id);
   await db.run('DELETE FROM commands WHERE created_at < ?', new Date(Date.now() - COMMAND_RETENTION_MS).toISOString());
 
-  if (row.type === 'PERMISSION_REPLY' && body.status === 'FAILED') {
+  if (['PERMISSION_REPLY', 'QUESTION_REPLY', 'QUESTION_REJECT'].includes(row.type) && body.status === 'FAILED') {
     // Let the user try again.
     await db.run(
       "UPDATE approvals SET status = 'PENDING' WHERE device_id = ? AND opencode_request_id = ? AND status = 'RESPONDING'",

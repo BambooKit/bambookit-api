@@ -528,3 +528,99 @@ describe('profile, photos and cloud storage isolation', () => {
     expect(await storage!.get('users/user-del-b/profile/avatar-1.png')).not.toBeNull();
   });
 });
+
+describe('agent questions, continue on PC and nicknames', () => {
+  it('routes a question to the PC that asked, with the answers, and notifies', async () => {
+    const token = await tokenFor('user-q-1', 'q1@example.com');
+    const desktop = await setupDesktop(token);
+    const { mobileId } = await pairPhone(token, desktop);
+    const questions = [
+      { header: 'Package manager', question: 'Which package manager should I use?', options: [{ label: 'npm', description: '' }, { label: 'bun', description: 'faster' }] },
+      { header: 'Tests', question: 'Which folders?', options: [{ label: 'src', description: '' }, { label: 'test', description: '' }], multiple: true },
+    ];
+    const ask = (status: string, extra: Record<string, unknown> = {}) =>
+      call('POST', '/v1/sync', {
+        token, deviceId: desktop.id, keys: desktop.keys,
+        body: {
+          sessions: [{ opencodeSessionId: 'ses_q', directory: 'C:\q', title: 'Q', status: 'busy' }],
+          approvals: [{ opencodeSessionId: 'ses_q', requestId: 'que_1', permission: 'question', title: questions[0].question, patterns: [], status, kind: 'question', questions, ...extra }],
+        },
+      });
+    expect((await ask('PENDING')).status).toBe(200);
+
+    const pending = (await call('GET', '/v1/approvals?status=PENDING', { token })).json.data;
+    expect(pending).toHaveLength(1);
+    expect(pending[0].kind).toBe('question');
+    expect(pending[0].questions[1].multiple).toBe(true);
+    const notes = (await call('GET', '/v1/notifications', { token })).json.data;
+    expect(notes.map((n: any) => n.type)).toContain('question.asked');
+
+    // A question cannot be "approved"; it needs an answer for every question.
+    expect((await call('POST', `/v1/approvals/${pending[0].id}/respond`, { token, body: { reply: 'once' } })).status).toBe(400);
+    expect((await call('POST', `/v1/approvals/${pending[0].id}/answer`, { token, body: { answers: [['bun']] } })).status).toBe(400);
+    const answered = await call('POST', `/v1/approvals/${pending[0].id}/answer`, { token, deviceId: mobileId, body: { answers: [['bun'], ['src', 'test']] } });
+    expect(answered.status).toBe(202);
+    expect(answered.json.command.type).toBe('QUESTION_REPLY');
+    expect(answered.json.command.payload).toEqual({ requestId: 'que_1', answers: [['bun'], ['src', 'test']] });
+    expect((await call('POST', `/v1/approvals/${pending[0].id}/answer`, { token, body: { answers: [['npm'], ['src']] } })).status).toBe(409);
+
+    // The engine confirms → answered.
+    await ask('APPROVED', { answers: [['bun'], ['src', 'test']] });
+    const done = (await call('GET', `/v1/approvals/${pending[0].id}`, { token })).json.data;
+    expect(done.status).toBe('APPROVED');
+    expect(done.answers).toEqual([['bun'], ['src', 'test']]);
+
+    // Dismissing a second question sends QUESTION_REJECT.
+    await call('POST', '/v1/sync', {
+      token, deviceId: desktop.id, keys: desktop.keys,
+      body: { approvals: [{ opencodeSessionId: 'ses_q', requestId: 'que_2', permission: 'question', title: 'Proceed?', patterns: [], status: 'PENDING', kind: 'question', questions: [questions[0]] }] },
+    });
+    const second = (await call('GET', '/v1/approvals?status=PENDING', { token })).json.data[0];
+    const dismissed = await call('POST', `/v1/approvals/${second.id}/respond`, { token, body: { reply: 'reject' } });
+    expect(dismissed.status).toBe(202);
+    expect(dismissed.json.command.type).toBe('QUESTION_REJECT');
+
+    // Another account cannot see or answer it.
+    const other = await tokenFor('user-q-2', 'q2@example.com');
+    expect((await call('POST', `/v1/approvals/${second.id}/answer`, { token: other, body: { answers: [['npm']] } })).status).toBe(404);
+  });
+
+  it('lets a phone ask the PC to continue a session, then chat in it', async () => {
+    const token = await tokenFor('user-cp-1', 'cp@example.com');
+    const desktop = await setupDesktop(token);
+    const sync = (remote: boolean) =>
+      call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { sessions: [{ opencodeSessionId: 'ses_cp', directory: 'C:\cp', title: 'CP', status: 'idle', remote }] } });
+    await sync(false);
+    const session = (await call('GET', '/v1/sessions', { token })).json.data[0];
+    expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'SEND_MESSAGE', payload: { text: 'hi' } } })).status).toBe(409);
+    const cont = await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'CONTINUE_ON_PC', payload: {} } });
+    expect(cont.status).toBe(202);
+    expect(cont.json.data.type).toBe('CONTINUE_ON_PC');
+    await sync(true);
+    expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'SEND_MESSAGE', payload: { text: 'hi' } } })).status).toBe(202);
+  });
+
+  it('keeps a BambooKit nickname over the sign-in name and tells every device', async () => {
+    const token = await tokenFor('user-nn-1', 'nick@example.com');
+    const before = (await call('GET', '/v1/me', { token })).json.data;
+    expect(before.name).toBe('nick');
+    expect(before.nickname).toBeNull();
+
+    const bus = await import('../src/realtime/bus.js');
+    const seen: string[] = [];
+    const off = bus.subscribe(before.id, (e) => { if (e.type === 'profile.updated') seen.push((e.payload as any).name); });
+    const set = await call('PATCH', '/v1/me', { token, body: { name: '  Satyam  ' } });
+    off();
+    expect(set.status).toBe(200);
+    expect(set.json.data.name).toBe('Satyam');
+    expect(seen).toEqual(['Satyam']);
+
+    // A fresh sign-in token with the provider's name does not overwrite it.
+    const again = await tokenFor('user-nn-1', 'nick@example.com');
+    expect((await call('GET', '/v1/me', { token: again })).json.data.name).toBe('Satyam');
+    expect((await call('PATCH', '/v1/me', { token, body: { name: 'x'.repeat(41) } })).status).toBe(400);
+    expect((await call('PATCH', '/v1/me', { token, body: { name: 'bad\u0007name' } })).status).toBe(400);
+    // Clearing falls back to the sign-in name.
+    expect((await call('PATCH', '/v1/me', { token, body: { name: '' } })).json.data.name).toBe('nick');
+  });
+});
