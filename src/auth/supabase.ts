@@ -8,6 +8,10 @@ export interface AuthUser {
   email: string | null;
   name: string | null;
   avatarUrl: string | null;
+  /** How this identity signs in. Email+password and Google one-tap are separate BambooKit accounts. */
+  provider: 'email' | 'google' | 'other';
+  /** From the identity provider's token; null when the token does not say. */
+  emailVerified: boolean | null;
 }
 
 const issuer = `${env.SUPABASE_URL.replace(/\/+$/, '')}/auth/v1`;
@@ -19,11 +23,16 @@ const remoteCache = new Map<string, { user: AuthUser; expires: number }>();
 function fromClaims(payload: JWTPayload & Record<string, any>): AuthUser {
   if (!payload.sub) throw unauthorized('Token has no subject');
   const meta = payload.user_metadata ?? {};
+  const raw = String(payload.app_metadata?.provider ?? payload.firebase?.sign_in_provider ?? '');
+  const provider = raw === 'email' || raw === 'password' ? 'email' : raw === 'google' || raw === 'google.com' ? 'google' : 'other';
+  const verified = payload.email_verified ?? meta.email_verified;
   return {
     id: payload.sub,
     email: payload.email ?? null,
     name: meta.full_name ?? meta.name ?? null,
     avatarUrl: meta.avatar_url ?? meta.picture ?? null,
+    provider,
+    emailVerified: typeof verified === 'boolean' ? verified : null,
   };
 }
 
@@ -44,7 +53,7 @@ async function verifyViaAuthServer(token: string): Promise<AuthUser> {
     throw unauthorized('Authentication service unavailable', 'AUTH_UNAVAILABLE');
   }
   const body = (await res.json()) as any;
-  const user = fromClaims({ sub: body.id, email: body.email, user_metadata: body.user_metadata });
+  const user = fromClaims({ sub: body.id, email: body.email, user_metadata: body.user_metadata, app_metadata: body.app_metadata, email_verified: body.email_confirmed_at ? true : body.email ? false : undefined });
   remoteCache.set(key, { user, expires: Date.now() + 60_000 });
   if (remoteCache.size > 5000) remoteCache.clear();
   return user;

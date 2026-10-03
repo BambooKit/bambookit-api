@@ -342,6 +342,10 @@ export const db: Database = env.POSTGRES_URL ? await openPostgres(env.POSTGRES_U
 /** Upgrades for databases created by earlier versions. Safe to run on every start. */
 async function migrate(d: Database) {
   await d.run('ALTER TABLE sessions ADD COLUMN remote INTEGER NOT NULL DEFAULT 0').catch(() => undefined);
+  // Profile: sign-in method, email verification (from the identity provider) and an uploaded photo in R2.
+  await d.run('ALTER TABLE users ADD COLUMN provider TEXT').catch(() => undefined);
+  await d.run('ALTER TABLE users ADD COLUMN email_verified INTEGER').catch(() => undefined);
+  await d.run('ALTER TABLE users ADD COLUMN avatar_key TEXT').catch(() => undefined);
   // Session chats, diffs and activity now live only on the PC; remove copies stored by earlier versions.
   await d.run('DELETE FROM session_parts');
   await d.run('DELETE FROM session_diffs');

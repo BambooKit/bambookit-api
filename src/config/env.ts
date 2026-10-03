@@ -33,6 +33,23 @@ const envSchema = z.object({
   // Max allowed clock skew for device request signatures.
   DEVICE_SIGNATURE_MAX_SKEW_SECONDS: z.coerce.number().default(300),
   EVENT_RETENTION_DAYS: z.coerce.number().default(14),
+
+  // Cloudflare R2 (S3-compatible) object storage: profile photos and 7-day session history copies.
+  // Server-side only; clients get short-lived signed URLs. Unset = cloud storage features are off.
+  CLOUDFLARE_ACCOUNT_ID: z.string().optional(),
+  R2_ACCESS_KEY_ID: z.string().optional(),
+  R2_SECRET_ACCESS_KEY: z.string().optional(),
+  R2_BUCKET_NAME: z.string().optional(),
+  // Defaults to https://<CLOUDFLARE_ACCOUNT_ID>.r2.cloudflarestorage.com
+  R2_ENDPOINT: z.string().url().optional(),
+  // 'memory' keeps objects in memory (tests and local development without R2).
+  STORAGE_DRIVER: z.enum(['r2', 'memory']).optional(),
+  SESSION_SNAPSHOT_DAYS: z.coerce.number().int().positive().default(7),
+
+  // Account deletion: Supabase Auth users are removed with the service-role key (server only, never in clients).
+  SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
+  // Firebase Web API key (public) to delete Firebase (Google one-tap) accounts with the user's own token.
+  FIREBASE_API_KEY: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

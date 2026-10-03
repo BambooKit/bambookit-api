@@ -2,6 +2,8 @@ import { serve } from '@hono/node-server';
 import { app } from './app.js';
 import { env, VERSION } from './config/env.js';
 import { logger } from './lib/logger.js';
+import { sweepExpiredSnapshots } from './modules/history.js';
+import { storage } from './services/storage.js';
 
 logger.info(`Starting BambooKit API v${VERSION}`, {
   port: env.PORT,
@@ -27,4 +29,14 @@ if (selfUrl && process.env.KEEP_ALIVE !== 'off') {
       .catch((err) => logger.warn('keep-alive ping failed', { error: String(err?.message ?? err) }));
   setInterval(ping, 10 * 60_000).unref();
   logger.info('Keep-alive enabled', { url: selfUrl, everyMinutes: 10 });
+}
+
+// Session history copies in R2 expire after SESSION_SNAPSHOT_DAYS (7) days.
+if (storage) {
+  const sweep = () => void sweepExpiredSnapshots().catch((err) => logger.warn('snapshot sweep failed', { error: String(err?.message ?? err) }));
+  setTimeout(sweep, 60_000).unref();
+  setInterval(sweep, 6 * 60 * 60_000).unref();
+  logger.info('Cloud storage enabled', { driver: storage.driver, sessionCopyDays: env.SESSION_SNAPSHOT_DAYS });
+} else {
+  logger.info('Cloud storage not configured (R2 env vars unset): profile photos and session copies are off');
 }

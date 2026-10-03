@@ -7,13 +7,6 @@ import { serializeDevice, serializeSession } from './serializers.js';
 export const accountRouter = new Hono<AppEnv>();
 accountRouter.use('*', requireUser);
 
-// GET /v1/me
-accountRouter.get('/me', async (c) => {
-  const user = c.get('user');
-  const row = await db.get('SELECT * FROM users WHERE id = ?', user.id);
-  return c.json({ data: { id: user.id, email: user.email, name: row?.name ?? user.name, avatarUrl: row?.avatar_url ?? user.avatarUrl, createdAt: row?.created_at } });
-});
-
 const count = async (sql: string, ...args: unknown[]) => Number((await db.get(sql, ...args))?.n ?? 0);
 
 // GET /v1/overview — real counts for the mobile/web home screen

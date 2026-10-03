@@ -2,7 +2,8 @@ node_modules
 dist
 coverage
 .env
-.env.local
+.env.*
+!.env.example
 *.log
 npm-debug.log*
 .DS_Store

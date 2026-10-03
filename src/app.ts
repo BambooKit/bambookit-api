@@ -17,6 +17,8 @@ import { syncRouter } from './modules/sync.js';
 import { realtimeRouter } from './modules/realtime.js';
 import { sharesRouter } from './modules/shares.js';
 import { relayRouter } from './modules/relay.js';
+import { profileRouter } from './modules/profile.js';
+import { historyRouter } from './modules/history.js';
 
 export const app = new Hono<AppEnv>();
 
@@ -49,10 +51,12 @@ app.get('/ready', async (c) => {
 });
 
 const v1 = new Hono<AppEnv>();
-v1.route('/', accountRouter); // /me, /overview, /activity
+v1.route('/', profileRouter); // /me, /me/avatar*, DELETE /me
+v1.route('/', accountRouter); // /overview, /activity
 v1.route('/devices', devicesRouter);
 v1.route('/pairing', pairingRouter);
 v1.route('/projects', projectsRouter);
+v1.route('/sessions', historyRouter); // /:id/history, /:id/file-versions, /:id/snapshot-upload
 v1.route('/sessions', sessionsRouter);
 v1.route('/commands', commandsRouter);
 v1.route('/approvals', approvalsRouter);

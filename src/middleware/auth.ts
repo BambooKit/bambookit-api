@@ -28,12 +28,14 @@ export type AppEnv = {
 };
 
 const UPSERT_USER = `
-  INSERT INTO users (id, email, name, avatar_url, created_at, last_seen_at)
-  VALUES (?, ?, ?, ?, ?, ?)
+  INSERT INTO users (id, email, name, avatar_url, provider, email_verified, created_at, last_seen_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(id) DO UPDATE SET
     email = excluded.email,
     name = COALESCE(excluded.name, users.name),
     avatar_url = COALESCE(excluded.avatar_url, users.avatar_url),
+    provider = excluded.provider,
+    email_verified = COALESCE(excluded.email_verified, users.email_verified),
     last_seen_at = excluded.last_seen_at
 `;
 
@@ -50,7 +52,8 @@ export const requireUser = createMiddleware<AppEnv>(async (c, next) => {
   const last = lastUpsert.get(user.id) ?? 0;
   if (Date.now() - last > 30_000) {
     const ts = now();
-    await db.run(UPSERT_USER, user.id, user.email, user.name, user.avatarUrl, ts, ts);
+    const verified = user.emailVerified === null ? null : user.emailVerified ? 1 : 0;
+    await db.run(UPSERT_USER, user.id, user.email, user.name, user.avatarUrl, user.provider, verified, ts, ts);
     lastUpsert.set(user.id, Date.now());
   }
   c.set('user', user);

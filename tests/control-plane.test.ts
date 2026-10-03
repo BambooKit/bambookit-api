@@ -1,4 +1,5 @@
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { gzipSync } from 'node:zlib';
 import { generateKeyPairSync, sign, createHash, randomUUID } from 'node:crypto';
 import { SignJWT } from 'jose';
 
@@ -10,6 +11,8 @@ process.env.SUPABASE_URL = 'https://test-project.supabase.co';
 process.env.SUPABASE_JWT_SECRET = 'test-jwt-secret-for-unit-tests-only-0123456789';
 process.env.LOG_LEVEL = 'error';
 process.env.FIREBASE_PROJECT_ID = 'test-firebase-project';
+process.env.STORAGE_DRIVER = 'memory';
+process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key';
 
 let app: typeof import('../src/app.js').app;
 let db: typeof import('../src/db/database.js').db;
@@ -427,5 +430,101 @@ describe('sessions continue on the PC first', () => {
     expect(text).toContain('working on it');
     expect((await db.get("SELECT COUNT(*) AS n FROM events WHERE type = 'session.part'")).n).toBe(0);
     expect((await db.get('SELECT COUNT(*) AS n FROM session_parts')).n).toBe(0);
+  });
+});
+
+describe('profile, photos and cloud storage isolation', () => {
+  it('returns the profile and keeps profile photos per user', async () => {
+    const { storage } = await import('../src/services/storage.js');
+    const alice = await tokenFor('user-pf-a', 'pfa@example.com');
+    const bob = await tokenFor('user-pf-b', 'pfb@example.com');
+    const me = (await call('GET', '/v1/me', { token: alice })).json.data;
+    expect(me).toMatchObject({ id: 'user-pf-a', email: 'pfa@example.com', cloudStorage: true, devices: 0, projects: 0 });
+
+    expect((await call('POST', '/v1/me/avatar-upload', { token: alice, body: { contentType: 'image/gif', size: 10 } })).status).toBe(400);
+    expect((await call('POST', '/v1/me/avatar-upload', { token: alice, body: { contentType: 'image/png', size: 5_000_000 } })).status).toBe(400);
+    const up = (await call('POST', '/v1/me/avatar-upload', { token: alice, body: { contentType: 'image/png', size: 4 } })).json.data;
+    expect(up.key.startsWith('users/user-pf-a/profile/')).toBe(true);
+    expect(up.expiresIn).toBeLessThanOrEqual(300);
+    expect((await call('POST', '/v1/me/avatar', { token: alice, body: { key: up.key } })).status).toBe(400); // not uploaded yet
+    await storage!.put(up.key, Buffer.from('png!'), 'image/png');
+    expect((await call('POST', '/v1/me/avatar', { token: alice, body: { key: up.key } })).status).toBe(200);
+    // Another user cannot claim this photo or reach this prefix through a crafted key.
+    expect((await call('POST', '/v1/me/avatar', { token: bob, body: { key: up.key } })).status).toBe(403);
+    expect((await call('POST', '/v1/me/avatar', { token: bob, body: { key: 'users/user-pf-b/profile/../../user-pf-a/profile/x.png' } })).status).toBe(403);
+    expect((await call('GET', '/v1/me', { token: alice })).json.data.avatarStored).toBe(true);
+  });
+
+  it('serves history live from the PC, else a cloud copy for 7 days only', async () => {
+    const { storage } = await import('../src/services/storage.js');
+    const token = await tokenFor('user-hist-1', 'hist@example.com');
+    const other = await tokenFor('user-hist-2', 'hist2@example.com');
+    const desktop = await setupDesktop(token);
+    const desktop2 = await setupDesktop(token);
+    await call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { sessions: [{ opencodeSessionId: 'ses_h', directory: 'C:\\h', title: 'H', status: 'idle' }] } });
+    const session = (await call('GET', '/v1/sessions', { token })).json.data[0];
+
+    expect((await call('GET', `/v1/sessions/${session.id}/history`, { token })).json.error.code).toBe('DESKTOP_OFFLINE');
+    const stop = await serveDesktop(token, desktop, (kind) => (kind === 'history' ? { prompts: [{ text: 'Fix it' }], changes: [] } : { path: 'a.ts', before: 'x', after: 'y' }));
+    const live = (await call('GET', `/v1/sessions/${session.id}/history`, { token })).json.data;
+    expect(live).toMatchObject({ source: 'pc', history: { prompts: [{ text: 'Fix it' }], sessionId: session.id } });
+    expect((await call('GET', `/v1/sessions/${session.id}/file-versions?path=a.ts`, { token })).json.data).toMatchObject({ before: 'x', after: 'y' });
+    stop();
+
+    // Only the session's own PC may upload its copy; size is capped.
+    expect((await call('POST', `/v1/sessions/${session.id}/snapshot-upload`, { token, deviceId: desktop2.id, keys: desktop2.keys, body: { size: 10 } })).status).toBe(403);
+    expect((await call('POST', `/v1/sessions/${session.id}/snapshot-upload`, { token, deviceId: desktop.id, keys: desktop.keys, body: { size: 50_000_000 } })).status).toBe(400);
+    const signed = (await call('POST', `/v1/sessions/${session.id}/snapshot-upload`, { token, deviceId: desktop.id, keys: desktop.keys, body: { size: 10 } })).json.data;
+    expect(signed.url).toContain(encodeURIComponent(`users/user-hist-1/sessions/${session.id}.json.gz`));
+
+    const key = `users/user-hist-1/sessions/${session.id}.json.gz`;
+    await storage!.put(key, gzipSync(JSON.stringify({ prompts: [{ text: 'Fix it' }] })), 'application/gzip');
+    const cloud = (await call('GET', `/v1/sessions/${session.id}/history`, { token })).json.data;
+    expect(cloud.source).toBe('cloud');
+    expect(cloud.history.prompts[0].text).toBe('Fix it');
+    expect((await call('GET', `/v1/sessions/${session.id}/history`, { token: other })).status).toBe(404);
+
+    (storage as any).objects.get(key).lastModified = new Date(Date.now() - 8 * 86_400_000);
+    expect((await call('GET', `/v1/sessions/${session.id}/history`, { token })).json.error.code).toBe('DESKTOP_OFFLINE');
+    const { sweepExpiredSnapshots } = await import('../src/modules/history.js');
+    expect(await sweepExpiredSnapshots()).toBeGreaterThanOrEqual(1);
+    expect(await storage!.get(key)).toBeNull();
+  });
+
+  it('deletes an account completely and only that account', async () => {
+    const { storage } = await import('../src/services/storage.js');
+    const alice = await tokenFor('user-del-a', 'dela@example.com');
+    const bob = await tokenFor('user-del-b', 'delb@example.com');
+    const desktopA = await setupDesktop(alice);
+    const desktopB = await setupDesktop(bob);
+    await call('POST', '/v1/sync', { token: alice, deviceId: desktopA.id, keys: desktopA.keys, body: { sessions: [{ opencodeSessionId: 'ses_da', directory: 'C:\\a', title: 'A', status: 'idle' }] } });
+    await call('POST', '/v1/sync', { token: bob, deviceId: desktopB.id, keys: desktopB.keys, body: { sessions: [{ opencodeSessionId: 'ses_db', directory: 'C:\\b', title: 'B', status: 'idle' }] } });
+    await storage!.put('users/user-del-a/profile/avatar-1.png', Buffer.from('a'), 'image/png');
+    await storage!.put('users/user-del-b/profile/avatar-1.png', Buffer.from('b'), 'image/png');
+
+    expect((await call('DELETE', '/v1/me', { token: alice, body: {} })).status).toBe(400);
+
+    const realFetch = globalThis.fetch;
+    const calls: string[] = [];
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) => {
+      const url = String(input);
+      if (url.includes('/auth/v1/admin/users/')) {
+        calls.push(`${init?.method} ${url}`);
+        return new Response('{}', { status: 200 });
+      }
+      return realFetch(input, init);
+    });
+    try {
+      expect((await call('DELETE', '/v1/me', { token: alice, body: { confirm: 'DELETE MY ACCOUNT' } })).status).toBe(200);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(calls).toEqual(['DELETE https://test-project.supabase.co/auth/v1/admin/users/user-del-a']);
+    expect((await db.get("SELECT COUNT(*) AS n FROM devices WHERE user_id = 'user-del-a'")).n).toBe(0);
+    expect((await db.get("SELECT COUNT(*) AS n FROM sessions WHERE user_id = 'user-del-a'")).n).toBe(0);
+    expect((await db.get("SELECT COUNT(*) AS n FROM users WHERE id = 'user-del-a'")).n).toBe(0);
+    expect(await storage!.get('users/user-del-a/profile/avatar-1.png')).toBeNull();
+    expect((await call('GET', '/v1/sessions', { token: bob })).json.data).toHaveLength(1);
+    expect(await storage!.get('users/user-del-b/profile/avatar-1.png')).not.toBeNull();
   });
 });
