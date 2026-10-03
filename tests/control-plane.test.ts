@@ -228,12 +228,17 @@ describe('remote control flow', () => {
       if (kind === 'transcript') return { parts: [{ opencodeSessionId: 'ses_oc_1', messageId: 'msg_1', partId: 'prt_1', role: 'user', type: 'text', text: 'Fix the auth bug', sortKey: '0001' }] };
       if (kind === 'filemap') return { files: [{ path: 'src/auth.ts', actions: ['edited'], firstTurn: 1, lastTurn: 1, additions: 3, deletions: 1, failed: false }] };
       if (kind === 'diagram') return { nodes: [{ id: 'src/auth.ts', label: 'auth.ts' }], edges: [] };
+      if (kind === 'tree') return { path: params.path, entries: [{ name: 'auth.ts', path: 'src/auth.ts', type: 'file', size: 10 }] };
+      if (kind === 'file') return { path: params.path, content: 'export {}', size: 9 };
       return { files: [{ file: 'src/auth.ts', status: 'modified', additions: 3, deletions: 1 }] };
     });
     expect((await call('GET', `/v1/sessions/${session.id}/parts`, { token })).json.data[0]).toMatchObject({ text: 'Fix the auth bug', sessionId: session.id });
     expect((await call('GET', `/v1/sessions/${session.id}/changes`, { token })).json.data[0]).toMatchObject({ file: 'src/auth.ts', additions: 3 });
     expect((await call('GET', `/v1/sessions/${session.id}/filemap`, { token })).json.data[0]).toMatchObject({ path: 'src/auth.ts', actions: ['edited'] });
     expect((await call('GET', `/v1/sessions/${session.id}/diagram`, { token })).json.data.nodes[0].label).toBe('auth.ts');
+    expect((await call('GET', `/v1/sessions/${session.id}/tree?path=src`, { token })).json.data).toMatchObject({ path: 'src', entries: [{ name: 'auth.ts' }] });
+    expect((await call('GET', `/v1/sessions/${session.id}/file?path=src/auth.ts`, { token })).json.data.content).toBe('export {}');
+    expect((await call('GET', `/v1/sessions/${session.id}/file`, { token })).status).toBe(400);
     stop();
 
     const approvals = await call('GET', '/v1/approvals?status=PENDING', { token });

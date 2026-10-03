@@ -112,6 +112,22 @@ sessionsRouter.get('/:id/diagram', async (c) => {
   return c.json({ data: await relay(user.id, await sessionDesktop(session), 'diagram', { opencodeSessionId: session.opencode_session_id }) });
 });
 
+// GET /v1/sessions/:id/tree?path= — one folder of the session's project (view only, live from the PC)
+sessionsRouter.get('/:id/tree', async (c) => {
+  const user = c.get('user');
+  const session = await ownedSession(user.id, c.req.param('id'));
+  const path = z.string().max(1000).parse(c.req.query('path') ?? '');
+  return c.json({ data: await relay(user.id, await sessionDesktop(session), 'tree', { opencodeSessionId: session.opencode_session_id, path }) });
+});
+
+// GET /v1/sessions/:id/file?path= — a project file's text (view only, live from the PC, never stored)
+sessionsRouter.get('/:id/file', async (c) => {
+  const user = c.get('user');
+  const session = await ownedSession(user.id, c.req.param('id'));
+  const path = z.string().min(1).max(1000).parse(c.req.query('path'));
+  return c.json({ data: await relay(user.id, await sessionDesktop(session), 'file', { opencodeSessionId: session.opencode_session_id, path }) });
+});
+
 // Commands that continue or change the conversation need the session to be continued on the PC first.
 const continueCommands = new Set(['SEND_MESSAGE', 'CONTINUE', 'RETRY', 'REVERT', 'UNREVERT', 'WRITE_FILE']);
 
