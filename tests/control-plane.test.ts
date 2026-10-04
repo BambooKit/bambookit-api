@@ -748,3 +748,35 @@ describe('remote control: models, provider keys, todos and request details', () 
     }
   });
 });
+
+describe('complete transcript from the PC', () => {
+  it('passes long text and tool details through without cutting them', async () => {
+    const token = await tokenFor('user-tx-1', 'tx@example.com');
+    const desktop = await setupDesktop(token);
+    await call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { sessions: [{ opencodeSessionId: 'ses_tx', directory: 'C:/tx', title: 'TX', status: 'idle' }] } });
+    const long = 'x'.repeat(50_000);
+    const stop = await serveDesktop(token, desktop, (kind) =>
+      kind === 'transcript'
+        ? {
+            parts: [
+              { opencodeSessionId: 'ses_tx', messageId: 'm1', partId: 'p1', role: 'assistant', type: 'text', text: long, sortKey: '1' },
+              {
+                opencodeSessionId: 'ses_tx', messageId: 'm1', partId: 'p2', role: 'assistant', type: 'tool', tool: 'bash', toolStatus: 'completed', toolTitle: 'npm test', sortKey: '2',
+                input: { command: 'npm test' }, output: 'all 12 tests passed', exitCode: 0, diff: null, time: { start: 1, end: 2 }, secretField: 'dropped',
+              },
+            ],
+          }
+        : null,
+    );
+    try {
+      const session = (await call('GET', '/v1/sessions', { token })).json.data.find((s: any) => s.title === 'TX');
+      const parts = (await call('GET', `/v1/sessions/${session.id}/parts`, { token })).json.data;
+      expect(parts[0].text.length).toBe(50_000);
+      expect(parts[1]).toMatchObject({ tool: 'bash', input: { command: 'npm test' }, output: 'all 12 tests passed', exitCode: 0, time: { start: 1, end: 2 } });
+      expect(parts[1].secretField).toBeUndefined();
+      expect((await db.get('SELECT COUNT(*) AS n FROM session_parts')).n).toBe(0);
+    } finally {
+      stop();
+    }
+  });
+});

@@ -7,7 +7,7 @@ import { commandPayloads, createCommand, resolveIssuer, type CommandType } from 
 import { serializeProject, serializeSession } from './serializers.js';
 import { relay } from './relay.js';
 import { publish } from '../realtime/bus.js';
-import { partView, type PartSync } from './sync.js';
+import { transcriptPartView, type PartSync } from './sync.js';
 
 const SESSION_SELECT = `
   SELECT s.*, p.name AS project_name,
@@ -116,7 +116,8 @@ sessionsRouter.get('/:id/parts', async (c) => {
   const session = await ownedSession(user.id, c.req.param('id'));
   const res = (await relay(user.id, await sessionDesktop(session), 'transcript', { opencodeSessionId: session.opencode_session_id })) as { parts?: PartSync[] } | null;
   const ts = new Date().toISOString();
-  return c.json({ data: (res?.parts ?? []).slice(-2000).map((p) => partView(session.id, p, ts)) });
+  // Complete content: full text, tool input/output/errors/diffs (older desktops send only the short live shape).
+  return c.json({ data: (res?.parts ?? []).slice(-2000).map((p) => transcriptPartView(session.id, p, ts)) });
 });
 
 // GET /v1/sessions/:id/changes — changed files summary, read live from the PC (patches: GET_DIFF command)

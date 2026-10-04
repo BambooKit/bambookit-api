@@ -141,6 +141,34 @@ export function partView(sessionId: string, p: PartSync, ts: string) {
   };
 }
 
+/**
+ * One part of the complete transcript the PC returns on request (GET /v1/sessions/:id/parts): the live shape
+ * plus full text and tool details. Only known fields are passed on; nothing here is stored.
+ */
+export function transcriptPartView(sessionId: string, p: any, ts: string) {
+  const str = (v: unknown, max: number) => (typeof v === 'string' ? v.slice(0, max) : null);
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const flag = (v: unknown) => v === true;
+  const time = p?.time && typeof p.time === 'object' ? { start: num(p.time.start), end: num(p.time.end) } : null;
+  const base = { ...partView(sessionId, { ...p, text: null }, ts), text: str(p?.text, 1_048_576), truncated: flag(p?.truncated), time };
+  if (p?.type !== 'tool') return base;
+  return {
+    ...base,
+    callId: str(p.callId, 200),
+    status: str(p.status, 40),
+    title: str(p.title, 2000),
+    input: p.input && typeof p.input === 'object' ? p.input : null,
+    inputTruncated: flag(p.inputTruncated),
+    output: str(p.output, 262_144),
+    outputTruncated: flag(p.outputTruncated),
+    error: str(p.error, 65_536),
+    diff: str(p.diff, 524_288),
+    diffTruncated: flag(p.diffTruncated),
+    exitCode: num(p.exitCode),
+    files: Array.isArray(p.files) ? p.files.slice(0, 200) : null,
+  };
+}
+
 syncRouter.post('/', async (c) => {
   const user = c.get('user');
   const device = c.get('device')!;
