@@ -2,7 +2,8 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db, now } from '../db/database.js';
 import { requireDevice, requireUser, type AppEnv } from '../middleware/auth.js';
-import { stableId } from '../lib/http.js';
+import { badRequest, stableId } from '../lib/http.js';
+import { logger } from '../lib/logger.js';
 import { emitEphemeral, publish } from '../realtime/bus.js';
 import { notify } from './notifications.js';
 import { refreshAchievements, trackWork } from './stats.js';
@@ -189,10 +190,49 @@ export function transcriptPartView(sessionId: string, p: any, ts: string) {
   };
 }
 
+/**
+ * Validates a sync batch item by item: an invalid item (or the overflow of a list that is too long) is
+ * dropped and reported, instead of rejecting the whole batch — one bad session must never stop the PC's
+ * approvals, questions and status from reaching phones. Only field paths are logged, never values.
+ */
+export function parseSyncTolerant(raw: unknown, deviceId: string) {
+  let input: any = raw && typeof raw === 'object' ? { ...(raw as object) } : {};
+  const rejected: Array<{ path: string; message: string }> = [];
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const res = syncSchema.safeParse(input);
+    if (res.success) {
+      if (rejected.length) logger.warn('sync items dropped', { deviceId, rejected: rejected.slice(0, 20) });
+      return { body: res.data, rejected };
+    }
+    const drop = new Map<string, Set<number>>();
+    for (const issue of res.error.issues) {
+      const [key, index] = issue.path;
+      rejected.push({ path: issue.path.join('.'), message: issue.message });
+      if (typeof key !== 'string') continue;
+      // Bad statistics only lose the statistics, not the session.
+      if (key === 'sessions' && typeof index === 'number' && issue.path[2] === 'stats' && input.sessions?.[index]) {
+        input.sessions = input.sessions.map((x: any, i: number) => (i === index ? { ...x, stats: undefined } : x));
+        continue;
+      }
+      if (typeof index === 'number') {
+        if (!drop.has(key)) drop.set(key, new Set());
+        drop.get(key)!.add(index);
+      } else if (Array.isArray(input[key]) && issue.code === 'too_big') {
+        input[key] = input[key].slice(0, Number((issue as any).maximum) || 0);
+      } else {
+        delete input[key];
+      }
+    }
+    for (const [key, indexes] of drop) if (Array.isArray(input[key])) input[key] = input[key].filter((_: unknown, i: number) => !indexes.has(i));
+    input = { ...input };
+  }
+  throw badRequest('Sync batch could not be read', 'INVALID_SYNC');
+}
+
 syncRouter.post('/', async (c) => {
   const user = c.get('user');
   const device = c.get('device')!;
-  const body = syncSchema.parse(JSON.parse(await c.req.text()));
+  const { body, rejected } = parseSyncTolerant(JSON.parse(await c.req.text()), device.id);
   const ts = now();
   const out: Array<Parameters<typeof publish>[0]> = [];
   const live: Array<Parameters<typeof emitEphemeral>[0]> = [];
@@ -333,5 +373,5 @@ syncRouter.post('/', async (c) => {
   for (const e of live) emitEphemeral(e);
   for (const n of notes) await notify(n);
   if (body.sessions?.length || body.projects?.length) await refreshAchievements(user.id);
-  return c.json({ data: { accepted: true, events: out.length } });
+  return c.json({ data: { accepted: true, events: out.length, ...(rejected.length ? { rejected: rejected.slice(0, 50) } : {}) } });
 });

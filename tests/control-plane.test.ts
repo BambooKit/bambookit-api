@@ -931,3 +931,29 @@ describe('admin panel and Telegram monitoring', () => {
     }
   });
 });
+
+describe('sync keeps working when one item is invalid', () => {
+  it('drops only the bad item, so approvals still reach phones', async () => {
+    const token = await tokenFor('user-tol-1', 'tol@example.com');
+    const desktop = await setupDesktop(token);
+    const res = await call('POST', '/v1/sync', {
+      token, deviceId: desktop.id, keys: desktop.keys,
+      body: {
+        projects: [{ opencodeProjectId: 'p_bad', name: '', directory: '/' }, { opencodeProjectId: 'p_ok', name: 'ok', directory: 'C:/ok' }],
+        sessions: [
+          { opencodeSessionId: 'ses_tol', directory: 'C:/ok', title: 'T', status: 'busy', stats: { linesAdded: -5 } },
+          { opencodeSessionId: 'ses_bad', directory: '', title: 'bad', status: 'busy' },
+        ],
+        approvals: [{ opencodeSessionId: 'ses_tol', requestId: 'per_tol', permission: 'bash', title: 'Write-Output hi', patterns: ['Write-Output hi'], status: 'PENDING' }],
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(res.json.data.rejected.map((r: any) => r.path)).toEqual(expect.arrayContaining(['projects.0.name', 'sessions.0.stats.linesAdded', 'sessions.1.directory']));
+    const sessions = (await call('GET', '/v1/sessions', { token })).json.data;
+    expect(sessions.map((s: any) => s.title)).toEqual(['T']);
+    const pending = (await call('GET', '/v1/approvals?status=PENDING', { token })).json.data;
+    expect(pending).toHaveLength(1);
+    expect(pending[0].title).toBe('Write-Output hi');
+    expect((await call('GET', '/v1/projects', { token })).json.data.map((p: any) => p.name)).toEqual(['ok']);
+  });
+});
