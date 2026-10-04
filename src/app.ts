@@ -20,6 +20,8 @@ import { relayRouter } from './modules/relay.js';
 import { API_VERSION, PROTOCOL_VERSION } from './lib/compat.js';
 import { statsRouter } from './modules/stats.js';
 import { metaRouter } from './modules/meta.js';
+import { adminRouter } from './modules/admin.js';
+import { telegramRouter } from './services/telegram.js';
 import { profileRouter } from './modules/profile.js';
 import { historyRouter } from './modules/history.js';
 
@@ -69,8 +71,11 @@ v1.route('/notifications', notificationsRouter);
 v1.route('/sync', syncRouter);
 v1.route('/realtime', realtimeRouter);
 v1.route('/relay', relayRouter);
+v1.route('/admin', adminRouter);
 
 app.route('/v1', v1);
+// Telegram monitoring bot webhook (secret-token protected; disabled without TELEGRAM_BOT_TOKEN).
+app.route('/telegram', telegramRouter);
 // Public session sharing (OpenCode share protocol + viewer). No user auth: secrets authorize writes.
 app.route('/', sharesRouter);
 app.notFound((c) =>

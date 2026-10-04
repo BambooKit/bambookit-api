@@ -4,6 +4,8 @@ import { env, VERSION } from './config/env.js';
 import { logger } from './lib/logger.js';
 import { sweepExpiredSnapshots } from './modules/history.js';
 import { storage } from './services/storage.js';
+import { alert, startTelegram, telegramEnabled } from './services/telegram.js';
+import { setNewUserListener } from './middleware/auth.js';
 
 logger.info(`Starting BambooKit API v${VERSION}`, {
   port: env.PORT,
@@ -16,6 +18,12 @@ logger.info(`Starting BambooKit API v${VERSION}`, {
 serve({ fetch: app.fetch, port: env.PORT, hostname: '::' }, (info) => {
   logger.info(`BambooKit API listening on http://localhost:${info.port}`);
 });
+
+if (telegramEnabled) {
+  setNewUserListener((u) => alert(`🆕 <b>New BambooKit user</b>
+${(u.email ?? '(no email)').replace(/[<>&]/g, '')} · ${u.provider}`));
+  void startTelegram(process.env.PUBLIC_API_URL ?? process.env.RENDER_EXTERNAL_URL);
+}
 
 // Render's free tier stops a web service after 15 minutes without inbound traffic. Requesting our
 // own public URL goes through Render's proxy and counts as traffic, so once awake the API stays up

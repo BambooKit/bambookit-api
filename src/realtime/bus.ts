@@ -174,3 +174,12 @@ export function webCount(userId: string): number {
 export function streamCount(userId: string, deviceIds: string[]): number {
   return webCount(userId) + deviceIds.reduce((n, id) => n + (connections.get(id) ?? 0), 0);
 }
+
+/** Open realtime streams across all users (admin monitoring). */
+export function connectionTotals() {
+  let devices = 0;
+  for (const n of connections.values()) devices += n;
+  let web = 0;
+  for (const n of webConnections.values()) web += n;
+  return { devices, web, connectedDeviceIds: [...connections.keys()] };
+}

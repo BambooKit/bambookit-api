@@ -43,6 +43,11 @@ const UPSERT_USER = `
 `;
 
 const lastUpsert = new Map<string, number>();
+/** Set by the Telegram bot to announce new sign-ups. */
+let onNewUser: ((u: { email: string | null; provider: string }) => void) | null = null;
+export function setNewUserListener(fn: typeof onNewUser) {
+  onNewUser = fn;
+}
 
 /** Requires a valid Supabase access token. Mirrors the user into the local users table. */
 export const requireUser = createMiddleware<AppEnv>(async (c, next) => {
@@ -56,8 +61,10 @@ export const requireUser = createMiddleware<AppEnv>(async (c, next) => {
   if (Date.now() - last > 30_000) {
     const ts = now();
     const verified = user.emailVerified === null ? null : user.emailVerified ? 1 : 0;
+    const isNew = !lastUpsert.has(user.id) && !(await db.get('SELECT 1 AS ok FROM users WHERE id = ?', user.id));
     await db.run(UPSERT_USER, user.id, user.email, user.name, user.avatarUrl, user.provider, verified, ts, ts);
     lastUpsert.set(user.id, Date.now());
+    if (isNew) onNewUser?.({ email: user.email, provider: user.provider });
   }
   c.set('user', user);
   c.set('device', null);

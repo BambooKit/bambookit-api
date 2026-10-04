@@ -50,6 +50,15 @@ const envSchema = z.object({
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   // Firebase Web API key (public) to delete Firebase (Google one-tap) accounts with the user's own token.
   FIREBASE_API_KEY: z.string().optional(),
+  // Admin panel and Telegram monitoring (all optional; features stay off until set).
+  // Comma-separated emails of BambooKit accounts that may open the admin panel.
+  ADMIN_EMAILS: z.string().optional(),
+  // Bot token from @BotFather. Never logged or returned by any route.
+  TELEGRAM_BOT_TOKEN: z.string().optional(),
+  // Comma-separated Telegram chat ids allowed to use the bot (send /start to the bot to see yours).
+  TELEGRAM_ADMIN_CHAT_IDS: z.string().optional(),
+  // Secret Telegram sends with every webhook call; derived from the bot token when not set.
+  TELEGRAM_WEBHOOK_SECRET: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

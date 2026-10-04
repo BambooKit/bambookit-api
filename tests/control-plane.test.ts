@@ -13,6 +13,9 @@ process.env.LOG_LEVEL = 'error';
 process.env.FIREBASE_PROJECT_ID = 'test-firebase-project';
 process.env.STORAGE_DRIVER = 'memory';
 process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key';
+process.env.ADMIN_EMAILS = 'admin@example.com';
+process.env.TELEGRAM_BOT_TOKEN = 'test-bot-token';
+process.env.TELEGRAM_ADMIN_CHAT_IDS = '111';
 
 let app: typeof import('../src/app.js').app;
 let db: typeof import('../src/db/database.js').db;
@@ -859,5 +862,72 @@ describe('profile statistics, achievements and compatibility', () => {
     expect(meta.status).toBe(200);
     expect(meta.json.data.protocol).toBeGreaterThanOrEqual(2);
     expect(meta.json.data.desktopRequirements.providerKeys.since).toBe('1.0.3');
+  });
+});
+
+describe('admin panel and Telegram monitoring', () => {
+  it('lets only listed admin accounts read service data', async () => {
+    const admin = await tokenFor('user-adm-1', 'admin@example.com');
+    const regular = await tokenFor('user-adm-2', 'someone@example.com');
+    expect((await call('GET', '/v1/me', { token: admin })).json.data.admin).toBe(true);
+    expect((await call('GET', '/v1/me', { token: regular })).json.data.admin).toBe(false);
+
+    const denied = await call('GET', '/v1/admin/overview', { token: regular });
+    expect(denied.status).toBe(403);
+    expect(denied.json.error.code).toBe('NOT_ADMIN');
+    expect((await call('GET', '/v1/admin/overview')).status).toBe(401);
+
+    const overview = await call('GET', '/v1/admin/overview', { token: admin });
+    expect(overview.status).toBe(200);
+    expect(overview.json.data.users.total).toBeGreaterThanOrEqual(2);
+    expect(overview.json.data.health).toHaveProperty('uptimeSeconds');
+    expect(overview.json.data.service.telegram).toBe(true);
+    // Never secrets.
+    expect(JSON.stringify(overview.json.data)).not.toContain('test-bot-token');
+
+    const users = await call('GET', '/v1/admin/users?limit=5', { token: admin });
+    expect(users.status).toBe(200);
+    expect(users.json.data.length).toBeLessThanOrEqual(5);
+    expect(users.json.data[0]).toHaveProperty('email');
+  });
+
+  it('answers the Telegram webhook only with the secret, and only admin chats get data', async () => {
+    const { webhookSecret } = await import('../src/services/telegram.js');
+    const sent: any[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: any, init: any) => {
+      if (String(url).startsWith('https://api.telegram.org/')) {
+        sent.push({ method: String(url).split('/').pop(), body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ ok: true, result: {} }), { headers: { 'Content-Type': 'application/json' } });
+      }
+      return realFetch(url, init);
+    }) as typeof fetch;
+    try {
+      const post = (secret: string | null, chatId: number, text: string) =>
+        app.request('http://localhost/telegram/webhook', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...(secret ? { 'X-Telegram-Bot-Api-Secret-Token': secret } : {}) },
+          body: JSON.stringify({ update_id: 1, message: { chat: { id: chatId }, text } }),
+        });
+      expect((await post(null, 111, '/start')).status).toBe(403);
+      expect((await post('wrong', 111, '/start')).status).toBe(403);
+      expect(sent).toHaveLength(0);
+
+      // A stranger only learns their own chat id.
+      expect((await post(webhookSecret, 999, '📊 Status')).status).toBe(200);
+      expect(sent[0].body.chat_id).toBe(999);
+      expect(sent[0].body.text).toContain('private');
+      expect(sent[0].body.text).not.toContain('Requests');
+
+      // The admin chat gets the button menu and real numbers.
+      await post(webhookSecret, 111, '👥 Users');
+      const reply = sent.at(-1);
+      expect(reply.body.chat_id).toBe(111);
+      expect(reply.body.text).toContain('Users');
+      expect(reply.body.reply_markup.keyboard.flat().map((b: any) => b.text)).toContain('📊 Status');
+      for (const s of sent) expect(JSON.stringify(s.body)).not.toContain('test-bot-token');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });

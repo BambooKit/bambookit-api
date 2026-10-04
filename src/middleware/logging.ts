@@ -1,6 +1,7 @@
 import { MiddlewareHandler } from 'hono';
 import { logger } from '../lib/logger.js';
 import { API_VERSION } from '../lib/compat.js';
+import { recordRequest } from '../lib/monitor.js';
 
 export const loggingMiddleware: MiddlewareHandler = async (c, next) => {
   const start = Date.now();
@@ -15,6 +16,7 @@ export const loggingMiddleware: MiddlewareHandler = async (c, next) => {
 
   const duration = Date.now() - start;
   const status = c.res.status;
+  recordRequest(status);
 
   logger.info(`${c.req.method} ${c.req.path} ${status} - ${duration}ms`, {
     requestId,
