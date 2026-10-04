@@ -6,6 +6,7 @@ import { HttpError, notFound } from '../lib/http.js';
 import { publish } from '../realtime/bus.js';
 import { createCommand, resolveIssuer } from './commands.js';
 import { serializeApproval } from './serializers.js';
+import { relay } from './relay.js';
 
 export const approvalsRouter = new Hono<AppEnv>();
 approvalsRouter.use('*', requireUser);
@@ -25,6 +26,20 @@ approvalsRouter.get('/', async (c) => {
   if (sessionId) (where.push('a.session_id = ?'), args.push(sessionId));
   const rows = await db.all(`${APPROVAL_SELECT} WHERE ${where.join(' AND ')} ORDER BY a.created_at DESC LIMIT 200`, ...args);
   return c.json({ data: rows.map(serializeApproval) });
+});
+
+// GET /v1/approvals/:id/detail — everything the agent attached to the request (full command, proposed diff,
+// question context), read live from the PC that asked. Not stored by the API.
+approvalsRouter.get('/:id/detail', async (c) => {
+  const user = c.get('user');
+  const approval = await db.get(`${APPROVAL_SELECT} WHERE a.id = ? AND a.user_id = ?`, c.req.param('id'), user.id);
+  if (!approval) throw notFound('Approval');
+  const desktop = await db.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', approval.device_id);
+  if (!desktop || desktop.revoked_at) throw notFound('Device');
+  const session = await db.get<{ opencode_session_id: string }>('SELECT opencode_session_id FROM sessions WHERE id = ?', approval.session_id);
+  return c.json({
+    data: await relay(user.id, desktop, 'approval', { requestId: approval.opencode_request_id, kind: approval.kind ?? 'permission', opencodeSessionId: session?.opencode_session_id ?? null }),
+  });
 });
 
 approvalsRouter.get('/:id', async (c) => {

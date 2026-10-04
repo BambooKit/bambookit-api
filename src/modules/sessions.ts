@@ -43,9 +43,24 @@ projectsRouter.get('/:id', async (c) => {
   return c.json({ data: serializeProject(row) });
 });
 
-// New sessions are started on the PC; phones and the website continue sessions the PC has opened.
-projectsRouter.post('/:id/sessions', () => {
-  throw forbidden('Start new sessions in BambooKit Desktop on your PC, then continue them from your phone.', 'START_ON_PC');
+// POST /v1/projects/:id/sessions { text, model?, agent? } — start a session on the PC that owns the project.
+// The PC creates it in the project's folder and marks it continued, so the phone can keep chatting in it.
+projectsRouter.post('/:id/sessions', async (c) => {
+  const user = c.get('user');
+  const project = await db.get(`${PROJECT_SELECT} WHERE p.id = ? AND p.user_id = ?`, c.req.param('id'), user.id);
+  if (!project) throw notFound('Project');
+  const body = z
+    .object({ text: z.string().min(1).max(20_000), model: z.object({ providerID: z.string().min(1).max(200), modelID: z.string().min(1).max(300) }).optional(), agent: z.string().min(1).max(100).optional() })
+    .parse(await c.req.json());
+  const res = await createCommand({
+    userId: user.id,
+    desktop: await desktopFor(project.device_id),
+    sessionId: null,
+    issuer: await resolveIssuer(user.id, c.req.header('X-BK-Device-Id')),
+    type: 'CREATE_SESSION',
+    payload: { directory: project.directory, ...body },
+  });
+  return c.json({ data: res.command, deviceOnline: res.deviceOnline }, 202);
 });
 
 // ---------------- Sessions ----------------
@@ -69,6 +84,13 @@ sessionsRouter.get('/', async (c) => {
 
 sessionsRouter.get('/:id', async (c) => {
   return c.json({ data: serializeSession(await ownedSession(c.get('user').id, c.req.param('id'))) });
+});
+
+// GET /v1/sessions/:id/todos — the agent's current todo list, read live from the PC
+sessionsRouter.get('/:id/todos', async (c) => {
+  const user = c.get('user');
+  const session = await ownedSession(user.id, c.req.param('id'));
+  return c.json({ data: await relay(user.id, await sessionDesktop(session), 'todos', { opencodeSessionId: session.opencode_session_id }) });
 });
 
 // PATCH /v1/sessions/:id { starred } — like / unlike a session (kept by BambooKit only)

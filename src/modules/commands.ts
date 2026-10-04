@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { db, now } from '../db/database.js';
 import { requireDevice, requireUser, type AppEnv, type DeviceRow } from '../middleware/auth.js';
 import { HttpError, forbidden, newId, notFound } from '../lib/http.js';
-import { isConnected, publish } from '../realtime/bus.js';
+import { emitEphemeral, isConnected, publish } from '../realtime/bus.js';
 import { commandRow, COMMAND_SELECT, serializeCommand } from './serializers.js';
 
 /** Commands older than this are never delivered — a stale remote action must not run hours later. */
@@ -12,7 +12,7 @@ export const COMMAND_TTL_MS = 5 * 60_000;
 export const COMMAND_RETENTION_MS = 15 * 60_000;
 
 export const commandPayloads = {
-  SEND_MESSAGE: z.object({ text: z.string().min(1).max(20_000) }),
+  SEND_MESSAGE: z.object({ text: z.string().min(1).max(20_000), model: z.object({ providerID: z.string().min(1).max(200), modelID: z.string().min(1).max(300) }).optional(), agent: z.string().min(1).max(100).optional() }),
   ABORT: z.object({}).strict(),
   CONTINUE: z.object({}).strict(),
   RETRY: z.object({}).strict(),
@@ -26,7 +26,14 @@ export const commandPayloads = {
   CONTINUE_ON_PC: z.object({}).strict(),
   // Rename the session on the PC (the engine owns the title; the index updates on the next sync).
   RENAME_SESSION: z.object({ title: z.string().trim().min(1).max(200) }),
-  CREATE_SESSION: z.object({ directory: z.string().min(1).max(1000), text: z.string().min(1).max(20_000) }),
+  CREATE_SESSION: z.object({ directory: z.string().min(1).max(1000), text: z.string().min(1).max(20_000), model: z.object({ providerID: z.string().min(1).max(200), modelID: z.string().min(1).max(300) }).optional(), agent: z.string().min(1).max(100).optional() }),
+  // Provider API keys travel end-to-end encrypted to the PC's RSA key (RSA-OAEP-SHA256 wrapping an AES-256-GCM key);
+  // this server only ever sees ciphertext and deletes it as soon as the PC answers.
+  SET_PROVIDER_KEY: z.object({
+    providerID: z.string().min(1).max(200),
+    envelope: z.object({ alg: z.literal('RSA-OAEP-256+A256GCM'), key: z.string().min(16).max(2000), iv: z.string().min(8).max(100), data: z.string().min(8).max(20_000) }),
+  }),
+  REMOVE_PROVIDER_KEY: z.object({ providerID: z.string().min(1).max(200) }),
   // Rewind the conversation (and, where the engine has snapshots, the files) to before a message.
   REVERT: z.object({ messageId: z.string().min(1).max(200) }),
   UNREVERT: z.object({}).strict(),
@@ -77,7 +84,10 @@ export async function createCommand(input: {
     ts,
   );
   const command = serializeCommand(await commandRow(id));
-  await publish({ userId: input.userId, deviceId: desktop.id, sessionId: input.sessionId, type: 'command.created', payload: command });
+  const event = { userId: input.userId, deviceId: desktop.id, sessionId: input.sessionId, type: 'command.created', payload: command };
+  // Encrypted provider keys are never written to the event log; an offline PC picks them up from its pending commands.
+  if (input.type === 'SET_PROVIDER_KEY') emitEphemeral(event);
+  else await publish(event);
   return { command, deviceOnline: isConnected(desktop.id) };
 }
 
@@ -129,7 +139,7 @@ commandsRouter.post('/:id/result', requireDevice('desktop'), async (c) => {
   await db.run('UPDATE commands SET status = ?, result = ?, error = ?, updated_at = ? WHERE id = ?', body.status, result, body.error ?? null, now(), row.id);
   // Session content belongs on the PC: drop message text and file contents from finished commands,
   // and delete command records (including results such as file reads) once they are no longer needed.
-  if (['SEND_MESSAGE', 'WRITE_FILE', 'CREATE_SESSION', 'QUESTION_REPLY'].includes(row.type)) await db.run("UPDATE commands SET payload = '{}' WHERE id = ?", row.id);
+  if (['SEND_MESSAGE', 'WRITE_FILE', 'CREATE_SESSION', 'QUESTION_REPLY', 'SET_PROVIDER_KEY'].includes(row.type)) await db.run("UPDATE commands SET payload = '{}' WHERE id = ?", row.id);
   await db.run('DELETE FROM commands WHERE created_at < ?', new Date(Date.now() - COMMAND_RETENTION_MS).toISOString());
 
   if (['PERMISSION_REPLY', 'QUESTION_REPLY', 'QUESTION_REJECT'].includes(row.type) && body.status === 'FAILED') {

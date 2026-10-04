@@ -350,6 +350,8 @@ async function migrate(d: Database) {
   await d.run('ALTER TABLE users ADD COLUMN nickname TEXT').catch(() => undefined);
   // Liked (starred) sessions: a BambooKit-only flag, never sent to the PC.
   await d.run('ALTER TABLE sessions ADD COLUMN starred INTEGER NOT NULL DEFAULT 0').catch(() => undefined);
+  // RSA public key a PC publishes so phones can encrypt provider API keys that only that PC can read.
+  await d.run('ALTER TABLE devices ADD COLUMN encryption_key TEXT').catch(() => undefined);
   // Questions the agent asks (kind = 'question') travel through approvals with their options and answers.
   await d.run("ALTER TABLE approvals ADD COLUMN kind TEXT NOT NULL DEFAULT 'permission'").catch(() => undefined);
   await d.run('ALTER TABLE approvals ADD COLUMN questions TEXT').catch(() => undefined);

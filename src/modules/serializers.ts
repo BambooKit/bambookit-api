@@ -34,6 +34,8 @@ export async function serializeDevice(row: DeviceRow) {
     lastSeenAt: row.last_seen_at,
     createdAt: row.created_at,
     revokedAt: row.revoked_at,
+    // Public half only: phones encrypt provider keys to it.
+    encryptionKey: row.kind === 'desktop' ? (row.encryption_key ?? null) : null,
     linkedDevices: links.map((l) => ({ id: l.id, name: l.name, kind: l.kind, platform: l.platform })),
     activeSession: active
       ? { id: active.id, title: active.title, status: active.status, projectName: active.project_name }

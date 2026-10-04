@@ -3,10 +3,11 @@ import { z } from 'zod';
 import { createPublicKey } from 'node:crypto';
 import { db, now } from '../db/database.js';
 import { requireDevice, requireSignature, requireUser, type AppEnv, type DeviceRow } from '../middleware/auth.js';
-import { badRequest, forbidden, notFound, stableId } from '../lib/http.js';
+import { HttpError, badRequest, forbidden, notFound, stableId } from '../lib/http.js';
 import { publish } from '../realtime/bus.js';
 import { COMMAND_SELECT, serializeCommand, serializeDevice } from './serializers.js';
-import { expireStaleCommands } from './commands.js';
+import { createCommand, expireStaleCommands, resolveIssuer } from './commands.js';
+import { relay } from './relay.js';
 
 export const devicesRouter = new Hono<AppEnv>();
 devicesRouter.use('*', requireUser);
@@ -18,6 +19,8 @@ const registerSchema = z.discriminatedUnion('kind', [
     platform: z.string().min(1).max(40),
     appVersion: z.string().max(40).optional(),
     publicKey: z.string().min(40).max(1000),
+    // RSA (≥ 2048-bit) SPKI PEM for end-to-end encrypted provider keys; the private key never leaves the PC.
+    encryptionKey: z.string().min(200).max(4000).optional(),
   }),
   z.object({
     kind: z.literal('mobile'),
@@ -55,14 +58,24 @@ devicesRouter.post('/register', async (c) => {
     id = stableId('mob', user.id, body.installationId);
   }
 
+  if (body.kind === 'desktop' && body.encryptionKey) {
+    let ok = false;
+    try {
+      const k = createPublicKey(body.encryptionKey);
+      ok = k.asymmetricKeyType === 'rsa' && (k.asymmetricKeyDetails?.modulusLength ?? 0) >= 2048;
+    } catch {}
+    if (!ok) throw badRequest('encryptionKey must be an RSA (2048-bit or larger) SPKI PEM', 'INVALID_ENCRYPTION_KEY');
+  }
+
   const existing = await getDevice(id);
   if (existing?.revoked_at) throw forbidden('This device was revoked. Reset the device identity to register again.', 'DEVICE_REVOKED');
 
   await db.run(
-    `INSERT INTO devices (id, user_id, kind, name, platform, app_version, public_key, push_token, last_seen_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO devices (id, user_id, kind, name, platform, app_version, public_key, push_token, encryption_key, last_seen_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET name = excluded.name, platform = excluded.platform,
        app_version = excluded.app_version, push_token = COALESCE(excluded.push_token, devices.push_token),
+       encryption_key = COALESCE(excluded.encryption_key, devices.encryption_key),
        last_seen_at = excluded.last_seen_at`,
     id,
     user.id,
@@ -72,6 +85,7 @@ devicesRouter.post('/register', async (c) => {
     body.appVersion ?? null,
     body.kind === 'desktop' ? body.publicKey : null,
     body.kind === 'mobile' ? body.pushToken ?? null : null,
+    body.kind === 'desktop' ? body.encryptionKey ?? null : null,
     ts,
     ts,
   );
@@ -138,6 +152,30 @@ devicesRouter.post('/:id/unlink', async (c) => {
   if (result.changes === 0) throw notFound('Device link');
   await publish({ userId: user.id, deviceId: device.id, type: 'device.unlinked', payload: { a: device.id, b: otherDeviceId } });
   return c.json({ data: { unlinked: true } });
+});
+
+// Commands about the PC itself rather than one session (provider keys).
+const deviceCommandTypes = ['SET_PROVIDER_KEY', 'REMOVE_PROVIDER_KEY'] as const;
+
+// POST /v1/devices/:id/commands { type, payload } — from a paired phone or the website
+devicesRouter.post('/:id/commands', async (c) => {
+  const user = c.get('user');
+  const desktop = await ownedDevice(user.id, c.req.param('id'));
+  if (desktop.kind !== 'desktop') throw badRequest('Commands go to a PC');
+  const body = z.object({ type: z.enum(deviceCommandTypes), payload: z.unknown().optional() }).parse(await c.req.json());
+  if (body.type === 'SET_PROVIDER_KEY' && !desktop.encryption_key) {
+    throw new HttpError(409, 'ENCRYPTION_KEY_MISSING', `Update BambooKit Desktop on ${desktop.name} to set provider keys from here.`);
+  }
+  const res = await createCommand({ userId: user.id, desktop, sessionId: null, issuer: await resolveIssuer(user.id, c.req.header('X-BK-Device-Id')), type: body.type, payload: body.payload ?? {} });
+  return c.json({ data: res.command, deviceOnline: res.deviceOnline }, 202);
+});
+
+// GET /v1/devices/:id/providers — the PC's configured AI providers and models (relayed live; never includes keys)
+devicesRouter.get('/:id/providers', async (c) => {
+  const user = c.get('user');
+  const desktop = await ownedDevice(user.id, c.req.param('id'));
+  if (desktop.kind !== 'desktop') throw badRequest('Providers live on a PC');
+  return c.json({ data: await relay(user.id, desktop, 'providers', {}) });
 });
 
 // GET /v1/devices/:id/commands — pending commands for the calling desktop (signed)

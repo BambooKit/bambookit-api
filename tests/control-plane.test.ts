@@ -371,7 +371,7 @@ describe('session sharing', () => {
 });
 
 describe('sessions continue on the PC first', () => {
-  it('lets phones chat only in sessions continued on the PC, and starts no sessions remotely', async () => {
+  it('lets phones chat only in sessions continued on the PC, and start new ones on the PC', async () => {
     const token = await tokenFor('user-tr-1', 'tr@example.com');
     const desktop = await setupDesktop(token);
     const sync = (remote: boolean) =>
@@ -400,10 +400,12 @@ describe('sessions continue on the PC first', () => {
     expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'WRITE_FILE', payload: { path: 'src/a.ts', content: 'x', baseSha256: null } } })).status).toBe(400);
     expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'REVERT', payload: {} } })).status).toBe(400);
 
+    // New sessions can be started from a phone: the PC creates them in the project's folder.
     const project = (await call('GET', '/v1/projects', { token })).json.data[0];
-    const start = await call('POST', `/v1/projects/${project.id}/sessions`, { token, body: { text: 'new' } });
-    expect(start.status).toBe(403);
-    expect(start.json.error.code).toBe('START_ON_PC');
+    const start = await call('POST', `/v1/projects/${project.id}/sessions`, { token, body: { text: 'new', model: { providerID: 'anthropic', modelID: 'claude-x' } } });
+    expect(start.status).toBe(202);
+    expect(start.json.data.type).toBe('CREATE_SESSION');
+    expect(start.json.data.payload).toMatchObject({ text: 'new', model: { providerID: 'anthropic', modelID: 'claude-x' } });
   });
 
   it('passes live chat parts to open streams without storing them', async () => {
@@ -649,5 +651,100 @@ describe('liking and renaming sessions', () => {
     expect(rename.status).toBe(202);
     expect(rename.json.data.payload).toEqual({ title: 'New name' });
     expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'RENAME_SESSION', payload: { title: '' } } })).status).toBe(400);
+  });
+});
+
+describe('remote control: models, provider keys, todos and request details', () => {
+  function encryptionKeyPem() {
+    const { publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    return publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  }
+
+  it('sends provider keys only as ciphertext for the PC, and never stores them in the event log', async () => {
+    const token = await tokenFor('user-pk-1', 'pk@example.com');
+    const keys = desktopKeys();
+    const enc = encryptionKeyPem();
+    const reg = await call('POST', '/v1/devices/register', { token, keys, body: { kind: 'desktop', name: 'PK PC', platform: 'windows', publicKey: keys.publicPem, encryptionKey: enc } });
+    expect(reg.status).toBe(201);
+    const desktopId = reg.json.data.id;
+    expect(reg.json.data.encryptionKey).toBe(enc);
+    // Only RSA keys of 2048 bits or more are accepted.
+    const weak = generateKeyPairSync('rsa', { modulusLength: 1024 }).publicKey.export({ type: 'spki', format: 'pem' }).toString();
+    expect((await call('POST', '/v1/devices/register', { token, keys, body: { kind: 'desktop', name: 'PK PC', platform: 'windows', publicKey: keys.publicPem, encryptionKey: weak } })).status).toBe(400);
+
+    const envelope = { alg: 'RSA-OAEP-256+A256GCM', key: 'A'.repeat(344), iv: 'B'.repeat(16), data: 'C'.repeat(64) };
+    const set = await call('POST', `/v1/devices/${desktopId}/commands`, { token, body: { type: 'SET_PROVIDER_KEY', payload: { providerID: 'openai', envelope } } });
+    expect(set.status).toBe(202);
+    // A plain key is not an accepted field.
+    expect((await call('POST', `/v1/devices/${desktopId}/commands`, { token, body: { type: 'SET_PROVIDER_KEY', payload: { providerID: 'openai', key: 'plain-text-key' } } })).status).toBe(400);
+    expect((await db.get("SELECT COUNT(*) AS n FROM events WHERE type = 'command.created' AND payload LIKE '%RSA-OAEP%'")).n).toBe(0);
+
+    // The PC picks it up from its pending commands, answers, and the ciphertext is deleted.
+    const pending = await call('GET', `/v1/devices/${desktopId}/commands`, { token, deviceId: desktopId, keys });
+    const cmd = pending.json.data.find((c: any) => c.type === 'SET_PROVIDER_KEY');
+    expect(cmd.payload.envelope.alg).toBe('RSA-OAEP-256+A256GCM');
+    await call('POST', `/v1/commands/${cmd.id}/result`, { token, deviceId: desktopId, keys, body: { status: 'SUCCEEDED', result: { providerID: 'openai', configured: true } } });
+    expect((await db.get('SELECT payload FROM commands WHERE id = ?', cmd.id)).payload).toBe('{}');
+
+    // A PC without an encryption key cannot receive keys.
+    const old = await setupDesktop(token);
+    const refused = await call('POST', `/v1/devices/${old.id}/commands`, { token, body: { type: 'SET_PROVIDER_KEY', payload: { providerID: 'openai', envelope } } });
+    expect(refused.status).toBe(409);
+    expect(refused.json.error.code).toBe('ENCRYPTION_KEY_MISSING');
+    // Another account cannot target this PC.
+    const other = await tokenFor('user-pk-2', 'pk2@example.com');
+    expect((await call('POST', `/v1/devices/${desktopId}/commands`, { token: other, body: { type: 'REMOVE_PROVIDER_KEY', payload: { providerID: 'openai' } } })).status).toBe(404);
+  });
+
+  it('relays providers, todos and full request details live from the PC, and passes todo updates without storing them', async () => {
+    const token = await tokenFor('user-rc-1', 'rc@example.com');
+    const me = (await call('GET', '/v1/me', { token })).json.data;
+    const desktop = await setupDesktop(token);
+    await call('POST', '/v1/sync', {
+      token, deviceId: desktop.id, keys: desktop.keys,
+      body: {
+        sessions: [{ opencodeSessionId: 'ses_rc', directory: 'C:/rc', title: 'RC', status: 'busy', remote: true }],
+        approvals: [{ opencodeSessionId: 'ses_rc', requestId: 'per_rc', permission: 'edit', title: 'src/a.ts', patterns: ['src/a.ts'], status: 'PENDING' }],
+      },
+    });
+    const stop = await serveDesktop(token, desktop, (kind, params) => {
+      if (kind === 'providers') return { providers: [{ id: 'anthropic', name: 'Anthropic', configured: true, models: [{ id: 'claude-x', name: 'Claude X' }] }], default: { providerID: 'anthropic', modelID: 'claude-x' } };
+      if (kind === 'todos') return { todos: [{ id: 't1', content: 'Fix auth', status: 'in_progress', priority: 'high' }], session: params.opencodeSessionId };
+      if (kind === 'approval') return { requestId: params.requestId, diff: '@@ -1 +1 @@\n-x\n+y\n' };
+      return null;
+    });
+    try {
+      const providers = await call('GET', `/v1/devices/${desktop.id}/providers`, { token });
+      expect(providers.status).toBe(200);
+      expect(providers.json.data.providers[0].models[0].id).toBe('claude-x');
+
+      const session = (await call('GET', '/v1/sessions', { token })).json.data[0];
+      const todos = await call('GET', `/v1/sessions/${session.id}/todos`, { token });
+      expect(todos.json.data.todos[0]).toMatchObject({ content: 'Fix auth', status: 'in_progress' });
+      expect(todos.json.data.session).toBe('ses_rc');
+
+      const approval = (await call('GET', '/v1/approvals?status=PENDING', { token })).json.data[0];
+      const detail = await call('GET', `/v1/approvals/${approval.id}/detail`, { token });
+      expect(detail.json.data.requestId).toBe('per_rc');
+      expect(detail.json.data.diff).toContain('+y');
+
+      // SEND_MESSAGE can choose the model and agent.
+      const send = await call('POST', `/v1/sessions/${session.id}/commands`, { token, body: { type: 'SEND_MESSAGE', payload: { text: 'go', model: { providerID: 'anthropic', modelID: 'claude-x' }, agent: 'build' } } });
+      expect(send.status).toBe(202);
+      expect(send.json.data.payload.model.modelID).toBe('claude-x');
+
+      // Todo updates go to open streams only.
+      const bus = await import('../src/realtime/bus.js');
+      const seen: any[] = [];
+      const off = bus.subscribe(me.id, (e) => {
+        if (e.type === 'session.todos') seen.push(e.payload);
+      });
+      await call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { todos: [{ opencodeSessionId: 'ses_rc', todos: [{ id: 't1', content: 'Fix auth', status: 'completed' }] }] } });
+      off();
+      expect(seen[0].todos[0].status).toBe('completed');
+      expect((await db.get("SELECT COUNT(*) AS n FROM events WHERE type = 'session.todos'")).n).toBe(0);
+    } finally {
+      stop();
+    }
   });
 });

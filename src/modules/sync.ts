@@ -103,6 +103,16 @@ const syncSchema = z.object({
     )
     .max(200)
     .optional(),
+  // The agent's todo list per session, passed live to open streams (the PC is the source of truth).
+  todos: z
+    .array(
+      z.object({
+        opencodeSessionId: z.string().max(200),
+        todos: z.array(z.object({ id: z.string().max(200), content: z.string().max(4000), status: z.string().max(40), priority: z.string().max(40).nullish() })).max(500),
+      }),
+    )
+    .max(50)
+    .optional(),
   // Complete list of request ids still pending on the desktop; anything else pending is expired.
   pendingApprovalSnapshot: z.array(z.string().max(200)).max(500).optional(),
   activity: z
@@ -255,6 +265,12 @@ syncRouter.post('/', async (c) => {
         await q.run("UPDATE approvals SET status = 'EXPIRED', resolved_at = ? WHERE id = ?", ts, p.id);
         out.push({ userId: user.id, deviceId: device.id, sessionId: p.session_id, type: 'approval.updated', payload: serializeApproval(await approvalRow(p.id)) });
       }
+    }
+
+    for (const t of body.todos ?? []) {
+      const sessionId = sessionIdFor(t.opencodeSessionId);
+      if (!(await ownsSession(sessionId))) continue;
+      live.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.todos', payload: { sessionId, todos: t.todos } });
     }
 
     for (const a of body.activity ?? []) {
