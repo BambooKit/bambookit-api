@@ -363,6 +363,8 @@ async function migrate(d: Database) {
   await d.run('ALTER TABLE sessions ADD COLUMN tasks_failed INTEGER NOT NULL DEFAULT 0').catch(() => undefined);
   await d.run("ALTER TABLE projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'").catch(() => undefined);
   await d.run('ALTER TABLE users ADD COLUMN timezone TEXT').catch(() => undefined);
+  // Recent activity before this sequence number is hidden ("Clear" in the apps).
+  await d.run('ALTER TABLE users ADD COLUMN activity_cleared_seq INTEGER').catch(() => undefined);
   await d.run(`CREATE TABLE IF NOT EXISTS work_intervals (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,

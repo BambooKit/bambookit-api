@@ -1,3 +1,4 @@
+import { publish } from '../realtime/bus.js';
 import { Hono } from 'hono';
 import { db } from '../db/database.js';
 import { requireUser, type AppEnv, type DeviceRow } from '../middleware/auth.js';
@@ -33,14 +34,26 @@ accountRouter.get('/overview', async (c) => {
   });
 });
 
+// DELETE /v1/activity — clear recent activity and notifications for this account (other users unaffected)
+accountRouter.delete('/activity', async (c) => {
+  const userId = c.get('user').id;
+  const seq = Number((await db.get<{ s: number | null }>('SELECT MAX(seq) AS s FROM events WHERE user_id = ?', userId))?.s ?? 0);
+  await db.run('UPDATE users SET activity_cleared_seq = ? WHERE id = ?', seq, userId);
+  const removed = await db.run('DELETE FROM notifications WHERE user_id = ?', userId);
+  await publish({ userId, type: 'activity.cleared', payload: { clearedThroughSeq: seq } });
+  return c.json({ data: { clearedThroughSeq: seq, notificationsRemoved: removed.changes } });
+});
+
 // GET /v1/activity?before=<seq>
 const ACTIVITY_TYPES = ['activity', 'approval.created', 'approval.updated', 'pairing.completed', 'device.registered', 'device.revoked', 'notification'];
 accountRouter.get('/activity', async (c) => {
   const before = Number(c.req.query('before') ?? Number.MAX_SAFE_INTEGER);
+  const cleared = Number((await db.get<{ s: number | null }>('SELECT activity_cleared_seq AS s FROM users WHERE id = ?', c.get('user').id))?.s ?? 0);
   const rows = await db.all(
-    `SELECT * FROM events WHERE user_id = ? AND seq < ? AND type IN (${ACTIVITY_TYPES.map(() => '?').join(',')}) ORDER BY seq DESC LIMIT 100`,
+    `SELECT * FROM events WHERE user_id = ? AND seq < ? AND seq > ? AND type IN (${ACTIVITY_TYPES.map(() => '?').join(',')}) ORDER BY seq DESC LIMIT 100`,
     c.get('user').id,
     before,
+    cleared,
     ...ACTIVITY_TYPES,
   );
   return c.json({ data: rows.map(rowToEvent) });

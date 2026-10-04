@@ -957,3 +957,23 @@ describe('sync keeps working when one item is invalid', () => {
     expect((await call('GET', '/v1/projects', { token })).json.data.map((p: any) => p.name)).toEqual(['ok']);
   });
 });
+
+describe('clearing recent activity', () => {
+  it('hides earlier activity and removes notifications for this account only', async () => {
+    const token = await tokenFor('user-clr-1', 'clr@example.com');
+    const other = await tokenFor('user-clr-2', 'clr2@example.com');
+    for (const t of [token, other]) {
+      const d = await setupDesktop(t);
+      await call('POST', '/v1/sync', { token: t, deviceId: d.id, keys: d.keys, body: { sessions: [{ opencodeSessionId: 'ses_clr', directory: 'C:/c', title: 'C', status: 'busy' }], approvals: [{ opencodeSessionId: 'ses_clr', requestId: 'per_clr', permission: 'bash', title: 'ls', patterns: ['ls'], status: 'PENDING' }] } });
+    }
+    expect((await call('GET', '/v1/activity', { token })).json.data.length).toBeGreaterThan(0);
+    expect((await call('GET', '/v1/notifications', { token })).json.data.length).toBeGreaterThan(0);
+    const res = await call('DELETE', '/v1/activity', { token });
+    expect(res.status).toBe(200);
+    expect((await call('GET', '/v1/activity', { token })).json.data).toHaveLength(0);
+    expect((await call('GET', '/v1/notifications', { token })).json.data).toHaveLength(0);
+    // The other account keeps its activity.
+    expect((await call('GET', '/v1/activity', { token: other })).json.data.length).toBeGreaterThan(0);
+    expect((await call('GET', '/v1/notifications', { token: other })).json.data.length).toBeGreaterThan(0);
+  });
+});

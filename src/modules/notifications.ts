@@ -38,6 +38,12 @@ notificationsRouter.post('/read-all', async (c) => {
   return c.json({ data: { updated: res.changes } });
 });
 
+// DELETE /v1/notifications — remove all of this account's notifications
+notificationsRouter.delete('/', async (c) => {
+  const res = await db.run('DELETE FROM notifications WHERE user_id = ?', c.get('user').id);
+  return c.json({ data: { removed: res.changes } });
+});
+
 notificationsRouter.post('/:id/read', async (c) => {
   const res = await db.run('UPDATE notifications SET read_at = COALESCE(read_at, ?) WHERE id = ? AND user_id = ?', now(), c.req.param('id'), c.get('user').id);
   if (!res.changes) throw notFound('Notification');
