@@ -61,7 +61,7 @@ async function setupDesktop(token: string) {
   const res = await call('POST', '/v1/devices/register', {
     token,
     keys,
-    body: { kind: 'desktop', name: 'Test PC', platform: 'windows', appVersion: '1.0.0', publicKey: keys.publicPem },
+    body: { kind: 'desktop', name: 'Test PC', platform: 'windows', appVersion: '1.0.3', publicKey: keys.publicPem },
   });
   expect(res.status).toBe(201);
   return { keys, id: res.json.data.id as string };
@@ -272,7 +272,7 @@ describe('remote control flow', () => {
     });
     expect((await call('GET', '/v1/approvals?status=PENDING', { token })).json.data).toHaveLength(0);
     const notes = await call('GET', '/v1/notifications', { token });
-    expect(notes.json.data.map((n: any) => n.type).sort()).toEqual(['approval.required', 'session.completed']);
+    expect(notes.json.data.map((n: any) => n.type).filter((t: string) => t !== 'achievement.unlocked').sort()).toEqual(['approval.required', 'session.completed']);
   });
 
   it('refuses commands from phones not paired with the desktop', async () => {
@@ -689,8 +689,9 @@ describe('remote control: models, provider keys, todos and request details', () 
     // A PC without an encryption key cannot receive keys.
     const old = await setupDesktop(token);
     const refused = await call('POST', `/v1/devices/${old.id}/commands`, { token, body: { type: 'SET_PROVIDER_KEY', payload: { providerID: 'openai', envelope } } });
-    expect(refused.status).toBe(409);
-    expect(refused.json.error.code).toBe('ENCRYPTION_KEY_MISSING');
+    expect(refused.status).toBe(426);
+    expect(refused.json.error.code).toBe('DESKTOP_UPDATE_REQUIRED');
+    expect(refused.json.error.details.capability).toBe('provider-keys.encrypted');
     // Another account cannot target this PC.
     const other = await tokenFor('user-pk-2', 'pk2@example.com');
     expect((await call('POST', `/v1/devices/${desktopId}/commands`, { token: other, body: { type: 'REMOVE_PROVIDER_KEY', payload: { providerID: 'openai' } } })).status).toBe(404);
@@ -778,5 +779,85 @@ describe('complete transcript from the PC', () => {
     } finally {
       stop();
     }
+  });
+});
+
+describe('profile statistics, achievements and compatibility', () => {
+  it('measures coding time from real work, counts code once per session, and unlocks achievements once', async () => {
+    const token = await tokenFor('user-sx-1', 'sx@example.com');
+    const desktop = await setupDesktop(token);
+    const me = (await call('GET', '/v1/me', { token })).json.data;
+    const stats = { filesCreated: 2, filesModified: 3, filesDeleted: 1, filesRenamed: 0, linesAdded: 120, linesDeleted: 30, edits: 7, testsRun: 2, testsPassed: 2, testsFailed: 0, commits: 1, deployments: 0, debugging: true };
+    const sync = (status: string, extra: Record<string, unknown> = {}) =>
+      call('POST', '/v1/sync', {
+        token, deviceId: desktop.id, keys: desktop.keys,
+        body: { projects: [{ opencodeProjectId: 'p_sx', name: 'Candy Shooter', directory: 'C:/sx' }], sessions: [{ opencodeSessionId: 'ses_sx', opencodeProjectId: 'p_sx', directory: 'C:/sx', title: 'Fix the crash', status, ...extra }] },
+      });
+    await sync('idle');
+    await sync('busy');
+    // Pretend the task started 90 minutes ago (busy_since is set by the API from the status change).
+    await db.run("UPDATE sessions SET busy_since = ? WHERE opencode_session_id = 'ses_sx'", new Date(Date.now() - 90 * 60_000).toISOString());
+    await sync('idle', { stats });
+    // The same totals arriving again must not double-count.
+    await sync('idle', { stats });
+
+    const res = await call('GET', '/v1/me/stats', { token });
+    expect(res.status).toBe(200);
+    const s = res.json.data;
+    expect(s.projects).toMatchObject({ total: 1, active: 1, completed: 0, archived: 0 });
+    expect(s.projects.list[0]).toMatchObject({ name: 'Candy Shooter', sessions: 1, tasks: 1, filesChanged: 6 });
+    expect(s.tasks).toMatchObject({ completed: 1, failed: 0, debugging: 1 });
+    expect(s.code).toMatchObject({ filesCreated: 2, filesModified: 3, filesDeleted: 1, linesAdded: 120, linesDeleted: 30, edits: 7, commits: 1 });
+    expect(s.codingTime.totalMs).toBeGreaterThanOrEqual(89 * 60_000);
+    expect(s.codingTime.totalMs).toBeLessThanOrEqual(91 * 60_000);
+    const byId = Object.fromEntries(s.achievements.map((a: any) => [a.id, a]));
+    expect(byId['first-project'].unlocked).toBe(true);
+    expect(byId['first-session'].unlocked).toBe(true);
+    expect(byId['first-change'].unlocked).toBe(true);
+    expect(byId['long-session'].unlocked).toBe(true);
+    expect(byId['project-manager']).toMatchObject({ unlocked: false, progress: 1, target: 5 });
+
+    // Unlocked once: a second refresh adds no rows or notifications.
+    await call('GET', '/v1/me/achievements', { token });
+    expect((await db.get('SELECT COUNT(*) AS n FROM user_achievements WHERE user_id = ?', me.id)).n).toBe(4);
+    const notes = (await call('GET', '/v1/notifications', { token })).json.data.filter((n: any) => n.type === 'achievement.unlocked');
+    expect(notes).toHaveLength(4);
+
+    // A failed task counts as failed, and the project status is the user's.
+    await sync('busy');
+    await sync('error');
+    expect((await call('GET', '/v1/me/stats', { token })).json.data.tasks).toMatchObject({ completed: 1, failed: 1 });
+    const project = (await call('GET', '/v1/projects', { token })).json.data[0];
+    expect((await call('PATCH', `/v1/projects/${project.id}`, { token, body: { status: 'completed' } })).json.data.status).toBe('completed');
+    expect((await call('GET', '/v1/me/stats', { token })).json.data.projects).toMatchObject({ active: 0, completed: 1 });
+    const other = await tokenFor('user-sx-2', 'sx2@example.com');
+    expect((await call('PATCH', `/v1/projects/${project.id}`, { token: other, body: { status: 'archived' } })).status).toBe(404);
+    expect((await call('PATCH', '/v1/me', { token, body: { timeZone: 'Asia/Kolkata' } })).status).toBe(200);
+    expect((await call('PATCH', '/v1/me', { token, body: { timeZone: 'Mars/Base' } })).status).toBe(400);
+  });
+
+  it('tells clients exactly which desktop version a feature needs, and explains unknown routes', async () => {
+    const token = await tokenFor('user-cx-1', 'cx@example.com');
+    const keys = desktopKeys();
+    const old = await call('POST', '/v1/devices/register', { token, keys, body: { kind: 'desktop', name: 'Old PC', platform: 'windows', appVersion: '1.0.2', publicKey: keys.publicPem } });
+    expect(old.json.data.capabilities).toContain('relay.tree');
+    expect(old.json.data.capabilities).not.toContain('relay.todos');
+    await call('POST', '/v1/sync', { token, deviceId: old.json.data.id, keys, body: { sessions: [{ opencodeSessionId: 'ses_cx', directory: 'C:/cx', title: 'CX', status: 'idle' }] } });
+    const session = (await call('GET', '/v1/sessions', { token })).json.data[0];
+    const todos = await call('GET', `/v1/sessions/${session.id}/todos`, { token });
+    expect(todos.status).toBe(426);
+    expect(todos.json.error.code).toBe('DESKTOP_UPDATE_REQUIRED');
+    expect(todos.json.error.details).toMatchObject({ currentVersion: '1.0.2', requiredVersion: '1.0.3', capability: 'relay.todos' });
+    expect(todos.json.requestId).toBeTruthy();
+
+    const missing = await call('GET', '/v1/definitely-not-a-route', { token });
+    expect(missing.status).toBe(404);
+    expect(missing.json.error.code).toBe('ROUTE_NOT_FOUND');
+    expect(missing.json.error.details).toMatchObject({ method: 'GET', path: '/v1/definitely-not-a-route' });
+
+    const meta = await call('GET', '/v1/meta');
+    expect(meta.status).toBe(200);
+    expect(meta.json.data.protocol).toBeGreaterThanOrEqual(2);
+    expect(meta.json.data.desktopRequirements.providerKeys.since).toBe('1.0.3');
   });
 });

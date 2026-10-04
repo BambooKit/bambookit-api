@@ -9,7 +9,7 @@ export const errorHandler: ErrorHandler = (err, c) => {
 
   if (err instanceof HttpError) {
     if (err.status >= 500) logger.error(err.message, { requestId, code: err.code });
-    return c.json({ error: { code: err.code, message: err.message }, requestId }, err.status);
+    return c.json({ error: { code: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) }, requestId }, err.status);
   }
 
   if (err instanceof ZodError) {

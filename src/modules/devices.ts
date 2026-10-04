@@ -8,6 +8,7 @@ import { publish } from '../realtime/bus.js';
 import { COMMAND_SELECT, serializeCommand, serializeDevice } from './serializers.js';
 import { createCommand, expireStaleCommands, resolveIssuer } from './commands.js';
 import { relay } from './relay.js';
+import { requireCapability } from '../lib/compat.js';
 
 export const devicesRouter = new Hono<AppEnv>();
 devicesRouter.use('*', requireUser);
@@ -21,6 +22,8 @@ const registerSchema = z.discriminatedUnion('kind', [
     publicKey: z.string().min(40).max(1000),
     // RSA (≥ 2048-bit) SPKI PEM for end-to-end encrypted provider keys; the private key never leaves the PC.
     encryptionKey: z.string().min(200).max(4000).optional(),
+    protocol: z.number().int().min(1).max(1000).optional(),
+    capabilities: z.array(z.string().max(60)).max(100).optional(),
   }),
   z.object({
     kind: z.literal('mobile'),
@@ -71,11 +74,12 @@ devicesRouter.post('/register', async (c) => {
   if (existing?.revoked_at) throw forbidden('This device was revoked. Reset the device identity to register again.', 'DEVICE_REVOKED');
 
   await db.run(
-    `INSERT INTO devices (id, user_id, kind, name, platform, app_version, public_key, push_token, encryption_key, last_seen_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO devices (id, user_id, kind, name, platform, app_version, public_key, push_token, encryption_key, protocol, capabilities, last_seen_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET name = excluded.name, platform = excluded.platform,
        app_version = excluded.app_version, push_token = COALESCE(excluded.push_token, devices.push_token),
        encryption_key = COALESCE(excluded.encryption_key, devices.encryption_key),
+       protocol = excluded.protocol, capabilities = excluded.capabilities,
        last_seen_at = excluded.last_seen_at`,
     id,
     user.id,
@@ -86,6 +90,8 @@ devicesRouter.post('/register', async (c) => {
     body.kind === 'desktop' ? body.publicKey : null,
     body.kind === 'mobile' ? body.pushToken ?? null : null,
     body.kind === 'desktop' ? body.encryptionKey ?? null : null,
+    body.kind === 'desktop' ? body.protocol ?? null : null,
+    body.kind === 'desktop' && body.capabilities ? JSON.stringify(body.capabilities) : null,
     ts,
     ts,
   );
@@ -163,9 +169,8 @@ devicesRouter.post('/:id/commands', async (c) => {
   const desktop = await ownedDevice(user.id, c.req.param('id'));
   if (desktop.kind !== 'desktop') throw badRequest('Commands go to a PC');
   const body = z.object({ type: z.enum(deviceCommandTypes), payload: z.unknown().optional() }).parse(await c.req.json());
-  if (body.type === 'SET_PROVIDER_KEY' && !desktop.encryption_key) {
-    throw new HttpError(409, 'ENCRYPTION_KEY_MISSING', `Update BambooKit Desktop on ${desktop.name} to set provider keys from here.`);
-  }
+  // Never send encrypted credentials to a PC that cannot read them.
+  if (body.type === 'SET_PROVIDER_KEY') requireCapability(desktop, 'providerKeys');
   const res = await createCommand({ userId: user.id, desktop, sessionId: null, issuer: await resolveIssuer(user.id, c.req.header('X-BK-Device-Id')), type: body.type, payload: body.payload ?? {} });
   return c.json({ data: res.command, deviceOnline: res.deviceOnline }, 202);
 });

@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { requireDevice, requireUser, type AppEnv, type DeviceRow } from '../middleware/auth.js';
 import { HttpError, newId } from '../lib/http.js';
 import { emitEphemeral, isConnected } from '../realtime/bus.js';
+import { REQUIREMENTS, requireCapability } from '../lib/compat.js';
 
 /**
  * Live relay between a phone/browser and a PC. Session chats, diffs and files are stored only on
@@ -20,6 +21,7 @@ const pending = new Map<string, Pending>();
 export type RelayKind = 'transcript' | 'changes' | 'filemap' | 'diagram' | 'tree' | 'file' | 'history' | 'fileversions' | 'providers' | 'todos' | 'approval';
 
 export async function relay(userId: string, desktop: DeviceRow, kind: RelayKind, params: Record<string, unknown>): Promise<unknown> {
+  if (kind in REQUIREMENTS) requireCapability(desktop, kind as keyof typeof REQUIREMENTS);
   if (!isConnected(desktop.id)) throw new HttpError(503, 'DESKTOP_OFFLINE', `${desktop.name} is offline. Session chats are stored on that PC; open BambooKit Desktop there to see them.`);
   const id = newId('rly');
   const result = new Promise<unknown>((resolve, reject) => {

@@ -17,6 +17,9 @@ import { syncRouter } from './modules/sync.js';
 import { realtimeRouter } from './modules/realtime.js';
 import { sharesRouter } from './modules/shares.js';
 import { relayRouter } from './modules/relay.js';
+import { API_VERSION, PROTOCOL_VERSION } from './lib/compat.js';
+import { statsRouter } from './modules/stats.js';
+import { metaRouter } from './modules/meta.js';
 import { profileRouter } from './modules/profile.js';
 import { historyRouter } from './modules/history.js';
 
@@ -32,8 +35,8 @@ app.use(
     // Only echo origins that are explicitly allowed. Native apps send no Origin header.
     origin: (origin) => (origin && allowedOrigins.includes(origin) ? origin : null),
     allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowHeaders: ['Content-Type', 'Authorization', 'X-Request-Id', 'X-BK-Device-Id', 'X-BK-Timestamp', 'X-BK-Signature', 'Last-Event-ID'],
-    exposeHeaders: ['X-Request-Id'],
+    allowHeaders: ['Content-Type', 'Authorization', 'X-Request-Id', 'X-BK-Device-Id', 'X-BK-Timestamp', 'X-BK-Signature', 'X-BK-Client', 'Last-Event-ID'],
+    exposeHeaders: ['X-Request-Id', 'X-BambooKit-API'],
   }),
 );
 
@@ -51,8 +54,10 @@ app.get('/ready', async (c) => {
 });
 
 const v1 = new Hono<AppEnv>();
+v1.route('/', metaRouter); // /meta, /releases/latest — public, so mounted before routers that require sign-in
 v1.route('/', profileRouter); // /me, /me/avatar*, DELETE /me
 v1.route('/', accountRouter); // /overview, /activity
+v1.route('/', statsRouter); // /me/stats, /me/achievements, PATCH /projects/:id
 v1.route('/devices', devicesRouter);
 v1.route('/pairing', pairingRouter);
 v1.route('/projects', projectsRouter);
@@ -68,4 +73,16 @@ v1.route('/relay', relayRouter);
 app.route('/v1', v1);
 // Public session sharing (OpenCode share protocol + viewer). No user auth: secrets authorize writes.
 app.route('/', sharesRouter);
-app.notFound((c) => c.json({ error: { code: 'NOT_FOUND', message: 'Route not found' } }, 404));
+app.notFound((c) =>
+  c.json(
+    {
+      error: {
+        code: 'ROUTE_NOT_FOUND',
+        message: `This BambooKit API (${API_VERSION}) has no ${c.req.method} ${c.req.path}. If your app is newer than the server, the server needs to be updated.`,
+        details: { method: c.req.method, path: c.req.path, apiVersion: API_VERSION, protocol: PROTOCOL_VERSION },
+      },
+      requestId: c.get('requestId') ?? null,
+    },
+    404,
+  ),
+);

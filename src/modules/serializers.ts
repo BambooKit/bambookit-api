@@ -1,3 +1,4 @@
+import { desktopCapabilities } from '../lib/compat.js';
 import { db, parseJson } from '../db/database.js';
 import { isConnected } from '../realtime/bus.js';
 import type { DeviceRow } from '../middleware/auth.js';
@@ -36,6 +37,8 @@ export async function serializeDevice(row: DeviceRow) {
     revokedAt: row.revoked_at,
     // Public half only: phones encrypt provider keys to it.
     encryptionKey: row.kind === 'desktop' ? (row.encryption_key ?? null) : null,
+    protocol: row.kind === 'desktop' ? (row.protocol ?? 1) : null,
+    capabilities: row.kind === 'desktop' ? [...desktopCapabilities(row)].sort() : null,
     linkedDevices: links.map((l) => ({ id: l.id, name: l.name, kind: l.kind, platform: l.platform })),
     activeSession: active
       ? { id: active.id, title: active.title, status: active.status, projectName: active.project_name }
@@ -54,6 +57,7 @@ export function serializeProject(row: any) {
     branch: row.branch,
     activeSessions: Number(row.active_sessions ?? 0),
     totalSessions: Number(row.total_sessions ?? 0),
+    status: row.status ?? 'active',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

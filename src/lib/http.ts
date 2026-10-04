@@ -2,9 +2,11 @@ import { createHash, randomBytes } from 'node:crypto';
 
 export class HttpError extends Error {
   constructor(
-    public status: 400 | 401 | 403 | 404 | 409 | 410 | 422 | 429 | 500 | 503,
+    public status: 400 | 401 | 403 | 404 | 409 | 410 | 422 | 426 | 429 | 500 | 502 | 503,
     public code: string,
     message: string,
+    /** Safe, structured context for the client's ⓘ details (never secrets). */
+    public details?: Record<string, unknown>,
   ) {
     super(message);
   }

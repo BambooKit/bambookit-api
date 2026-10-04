@@ -5,6 +5,7 @@ import { requireDevice, requireUser, type AppEnv } from '../middleware/auth.js';
 import { stableId } from '../lib/http.js';
 import { emitEphemeral, publish } from '../realtime/bus.js';
 import { notify } from './notifications.js';
+import { refreshAchievements, trackWork } from './stats.js';
 import { serializeApproval, serializeProject, serializeSession } from './serializers.js';
 
 /**
@@ -32,6 +33,23 @@ const partSchema = z.object({
   sortKey: z.string().max(100),
 });
 
+const count = z.number().int().min(0).max(100_000_000).default(0);
+export const sessionStatsSchema = z.object({
+  filesCreated: count,
+  filesModified: count,
+  filesDeleted: count,
+  filesRenamed: count,
+  linesAdded: count,
+  linesDeleted: count,
+  edits: count,
+  testsRun: count,
+  testsPassed: count,
+  testsFailed: count,
+  commits: count,
+  deployments: count,
+  debugging: z.boolean().default(false),
+});
+
 const syncSchema = z.object({
   projects: z
     .array(z.object({ opencodeProjectId: z.string().min(1), name: z.string().min(1).max(200), directory: z.string().min(1).max(1000), branch: z.string().max(200).nullish() }))
@@ -56,6 +74,8 @@ const syncSchema = z.object({
         // True once the user has continued this session on the PC; only then may phones chat in it.
         remote: z.boolean().default(false),
         createdAt: z.string().optional(),
+        // Totals for the whole session computed by the PC from its own records (replaced on every sync).
+        stats: sessionStatsSchema.optional(),
       }),
     )
     .max(500)
@@ -215,6 +235,8 @@ syncRouter.post('/', async (c) => {
         id, user.id, device.id, projectExists ? projectId : null, s.opencodeSessionId, s.parentId ?? null, s.directory, s.title || 'Untitled session',
         s.status, s.statusMessage ?? null, s.agent ?? null, s.model ?? null, s.additions, s.deletions, s.files, s.currentAction ?? null, s.remote ? 1 : 0, s.createdAt ?? ts, ts,
       );
+      if (s.stats) await q.run('UPDATE sessions SET stats = ? WHERE id = ?', JSON.stringify(s.stats), id);
+      await trackWork(q, { userId: user.id, sessionId: id, projectId: projectExists ? projectId : null, previous: previous?.status ?? null, status: s.status, parent: !!s.parentId, ts });
       const row = await q.get('SELECT s.*, p.name AS project_name FROM sessions s LEFT JOIN projects p ON p.id = s.project_id WHERE s.id = ?', id);
       out.push({ userId: user.id, deviceId: device.id, projectId: row.project_id, sessionId: id, type: 'session.updated', payload: serializeSession(row) });
 
@@ -310,5 +332,6 @@ syncRouter.post('/', async (c) => {
   for (const e of out) await publish(e);
   for (const e of live) emitEphemeral(e);
   for (const n of notes) await notify(n);
+  if (body.sessions?.length || body.projects?.length) await refreshAchievements(user.id);
   return c.json({ data: { accepted: true, events: out.length } });
 });

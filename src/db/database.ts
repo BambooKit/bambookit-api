@@ -352,6 +352,35 @@ async function migrate(d: Database) {
   await d.run('ALTER TABLE sessions ADD COLUMN starred INTEGER NOT NULL DEFAULT 0').catch(() => undefined);
   // RSA public key a PC publishes so phones can encrypt provider API keys that only that PC can read.
   await d.run('ALTER TABLE devices ADD COLUMN encryption_key TEXT').catch(() => undefined);
+  // Protocol version and feature list a desktop reports when it registers (see lib/compat.ts).
+  await d.run('ALTER TABLE devices ADD COLUMN protocol INTEGER').catch(() => undefined);
+  // Activity statistics (see modules/stats.ts): per-session totals reported by the PC, active work time
+  // measured from engine status changes, and the user's time zone for calendar weeks and night hours.
+  await d.run('ALTER TABLE sessions ADD COLUMN stats TEXT').catch(() => undefined);
+  await d.run('ALTER TABLE sessions ADD COLUMN busy_since TEXT').catch(() => undefined);
+  await d.run('ALTER TABLE sessions ADD COLUMN active_ms INTEGER NOT NULL DEFAULT 0').catch(() => undefined);
+  await d.run('ALTER TABLE sessions ADD COLUMN tasks_completed INTEGER NOT NULL DEFAULT 0').catch(() => undefined);
+  await d.run('ALTER TABLE sessions ADD COLUMN tasks_failed INTEGER NOT NULL DEFAULT 0').catch(() => undefined);
+  await d.run("ALTER TABLE projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'").catch(() => undefined);
+  await d.run('ALTER TABLE users ADD COLUMN timezone TEXT').catch(() => undefined);
+  await d.run(`CREATE TABLE IF NOT EXISTS work_intervals (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    project_id TEXT,
+    session_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    outcome TEXT NOT NULL
+  )`);
+  await d.run('CREATE INDEX IF NOT EXISTS work_intervals_user ON work_intervals(user_id, started_at)');
+  await d.run(`CREATE TABLE IF NOT EXISTS user_achievements (
+    user_id TEXT NOT NULL,
+    achievement TEXT NOT NULL,
+    unlocked_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, achievement)
+  )`);
+  await d.run('ALTER TABLE devices ADD COLUMN capabilities TEXT').catch(() => undefined);
   // Questions the agent asks (kind = 'question') travel through approvals with their options and answers.
   await d.run("ALTER TABLE approvals ADD COLUMN kind TEXT NOT NULL DEFAULT 'permission'").catch(() => undefined);
   await d.run('ALTER TABLE approvals ADD COLUMN questions TEXT').catch(() => undefined);
