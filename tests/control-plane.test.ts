@@ -1114,6 +1114,44 @@ describe('plans, limits, payments and rewarded ads', () => {
     expect((await call('POST', '/v1/billing/checkout', { token, body: { productId: 'pro-forever' } })).status).toBe(400);
   });
 
+  it('follows the App ID to the right Cashfree server and explains rejections', async () => {
+    const { env } = await import('../src/config/env.js');
+    const token = await tokenFor('user-bill-env', 'envcheck@example.com');
+    const saved = { appId: env.CASHFREE_APP_ID, mode: env.CASHFREE_ENV };
+    const urls: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: any, init: any) => {
+      const u = String(url);
+      if (!u.includes('cashfree.com')) return realFetch(url, init);
+      urls.push(u);
+      return Response.json({ message: 'authentication Failed', code: 'request_failed', type: 'authentication_error' }, { status: 401 });
+    }) as typeof fetch;
+    try {
+      env.CASHFREE_ENV = undefined;
+      env.CASHFREE_APP_ID = '1234prodkey';
+      const prod = await call('POST', '/v1/billing/checkout', { token, body: { productId: 'pro-month' } });
+      expect(urls.at(-1)).toBe('https://api.cashfree.com/pg/orders');
+      expect(prod.status).toBe(502);
+      expect(prod.json.error.message).toContain('authentication Failed');
+      expect(prod.json.error.details).toMatchObject({ providerStatus: 401, providerType: 'authentication_error', environment: 'production' });
+      expect((await call('GET', '/v1/billing/plans')).json.data.payments.environment).toBe('production');
+
+      env.CASHFREE_APP_ID = 'TEST1234';
+      await call('POST', '/v1/billing/checkout', { token, body: { productId: 'pro-month' } });
+      expect(urls.at(-1)).toBe('https://sandbox.cashfree.com/pg/orders');
+
+      env.CASHFREE_ENV = 'sandbox';
+      env.CASHFREE_APP_ID = '1234prodkey';
+      const mismatch = await call('POST', '/v1/billing/checkout', { token, body: { productId: 'pro-month' } });
+      expect(mismatch.json.error.details.hint).toContain('production key but CASHFREE_ENV is sandbox');
+      expect(JSON.stringify(mismatch.json)).not.toContain('test-secret');
+    } finally {
+      globalThis.fetch = realFetch;
+      env.CASHFREE_APP_ID = saved.appId;
+      env.CASHFREE_ENV = saved.mode;
+    }
+  });
+
   it('creates Cashfree orders and grants Pro once per verified payment', async () => {
     const token = await tokenFor('user-bill-pay', 'payer.person@gmail.com');
     const uid = await userId(token);

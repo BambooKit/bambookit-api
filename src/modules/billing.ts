@@ -54,7 +54,7 @@ const PLACEHOLDER_PHONE = '9999999999';
  * The PC limit applies only to accounts created on or after this date; earlier accounts keep every PC
  * they register (grandfathered). Mutable only so tests can pin it.
  */
-export const planPolicy = { desktopLimitSince: '2026-10-06T00:00:00Z' };
+export const planPolicy = { desktopLimitSince: '2026-10-05T12:00:00Z' };
 
 // ---------------------------------------------------------------- time zone days
 

@@ -7,7 +7,8 @@ import { logger } from '../lib/logger.js';
  * Cashfree Payment Gateway (PG Orders API).
  * - Credentials come from CASHFREE_APP_ID / CASHFREE_SECRET_KEY and are read on every call, so the
  *   feature switches on as soon as they are set. They are never logged or returned.
- * - CASHFREE_ENV picks sandbox (default) or production.
+ * - CASHFREE_ENV picks sandbox or production. When unset it follows the App ID: Cashfree's test App IDs
+ *   start with "TEST" (sandbox), every other App ID is a production key.
  * Docs: https://www.cashfree.com/docs/api-reference/payments/latest/orders/create
  */
 export const CASHFREE_API_VERSION = '2023-08-01';
@@ -15,12 +16,22 @@ export const CASHFREE_API_VERSION = '2023-08-01';
 export function cashfreeConfig() {
   const appId = env.CASHFREE_APP_ID?.trim();
   const secret = env.CASHFREE_SECRET_KEY?.trim();
-  const environment = env.CASHFREE_ENV;
   if (!appId || !secret) return null;
+  const environment = cashfreeEnvironment();
   return { appId, secret, environment, base: environment === 'production' ? 'https://api.cashfree.com' : 'https://sandbox.cashfree.com' };
 }
 
-export const cashfreeEnvironment = () => env.CASHFREE_ENV;
+/** The configured environment, or the one the App ID belongs to when CASHFREE_ENV is unset. */
+export const cashfreeEnvironment = (): 'sandbox' | 'production' =>
+  env.CASHFREE_ENV ?? (!env.CASHFREE_APP_ID?.trim() || /^TEST/i.test(env.CASHFREE_APP_ID.trim()) ? 'sandbox' : 'production');
+
+/** A production App ID sent to the sandbox server (or the reverse) is the most common setup mistake. */
+function keyMismatch(appId: string, environment: string) {
+  const testKey = /^TEST/i.test(appId);
+  if (testKey && environment === 'production') return 'The Cashfree App ID is a test (sandbox) key but CASHFREE_ENV is production.';
+  if (!testKey && environment === 'sandbox') return 'The Cashfree App ID is a production key but CASHFREE_ENV is sandbox.';
+  return null;
+}
 
 function requireConfig() {
   const cfg = cashfreeConfig();
@@ -52,7 +63,18 @@ async function request(method: 'GET' | 'POST', path: string, body?: unknown): Pr
   if (!res.ok) {
     // Cashfree errors carry { code, type, message } — safe to log (no credentials or session ids).
     logger.warn('cashfree request rejected', { status: res.status, code: String(json?.code ?? ''), type: String(json?.type ?? ''), message: String(json?.message ?? '').slice(0, 200) });
-    throw new HttpError(502, 'PAYMENT_PROVIDER_ERROR', 'The payment provider rejected the request. Try again later.', { providerStatus: res.status, providerCode: json?.code ?? null });
+    const providerMessage = String(json?.message ?? '').slice(0, 300) || null;
+    const hint =
+      (res.status === 401 || res.status === 403 ? keyMismatch(cfg.appId, cfg.environment) : null) ??
+      (res.status === 401 ? 'Cashfree did not accept the App ID and Secret Key. Check both on the server.' : null);
+    throw new HttpError(502, 'PAYMENT_PROVIDER_ERROR', `The payment provider rejected the request${providerMessage ? `: ${providerMessage}` : '.'}`, {
+      providerStatus: res.status,
+      providerCode: json?.code ?? null,
+      providerType: json?.type ?? null,
+      providerMessage,
+      environment: cfg.environment,
+      hint,
+    });
   }
   return json;
 }

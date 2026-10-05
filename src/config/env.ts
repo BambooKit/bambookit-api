@@ -64,7 +64,7 @@ const envSchema = z.object({
   // Cashfree dashboard -> Developers -> API keys. Never logged or returned.
   CASHFREE_APP_ID: z.string().optional(),
   CASHFREE_SECRET_KEY: z.string().optional(),
-  CASHFREE_ENV: z.preprocess((v) => (v === '' ? undefined : v), z.enum(['sandbox', 'production']).default('sandbox')),
+  CASHFREE_ENV: z.preprocess((v) => (v === '' ? undefined : v), z.enum(['sandbox', 'production']).optional()),
   // Page Cashfree returns the buyer to (?order_id=... is appended). Defaults to the BambooKit website.
   BILLING_RETURN_URL: z.string().url().optional().or(z.literal('').transform(() => undefined)),
   // HMAC key for rewarded-ad custom data; derived from another configured server secret when unset.
