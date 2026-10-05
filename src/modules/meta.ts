@@ -37,7 +37,7 @@ type Release = {
   download: { name: string; url: string; size: number } | null;
 };
 
-async function latestRelease(platform: keyof typeof REPOS): Promise<Release> {
+export async function latestRelease(platform: keyof typeof REPOS): Promise<Release> {
   const hit = cache.get(platform);
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.data as Release;
   let res: Response;

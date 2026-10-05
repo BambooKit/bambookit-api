@@ -4,6 +4,7 @@ import { env } from '../config/env.js';
 import { verifySupabaseToken, type AuthUser } from '../auth/supabase.js';
 import { db, now } from '../db/database.js';
 import { forbidden, sha256, unauthorized } from '../lib/http.js';
+import { recordActiveDay } from '../lib/activity.js';
 
 export interface DeviceRow {
   id: string;
@@ -65,6 +66,7 @@ export const requireUser = createMiddleware<AppEnv>(async (c, next) => {
     await db.run(UPSERT_USER, user.id, user.email, user.name, user.avatarUrl, user.provider, verified, ts, ts);
     lastUpsert.set(user.id, Date.now());
     if (isNew) onNewUser?.({ email: user.email, provider: user.provider });
+    await recordActiveDay(user.id);
   }
   c.set('user', user);
   c.set('device', null);
@@ -107,7 +109,10 @@ export function requireDevice(kind?: 'desktop' | 'mobile') {
       await requireSignature(c, device.public_key);
     }
 
-    await db.run('UPDATE devices SET last_seen_at = ? WHERE id = ?', now(), device.id);
+    // Phones report their app version in X-BK-Client (e.g. "android/1.0.7"); keep it current for the admin panel.
+    const client = device.kind === 'mobile' ? /^(?:android|ios)\/(\d+(?:\.\d+){0,3}(?:-[\w.]{1,20})?)$/i.exec(c.req.header('X-BK-Client')?.trim() ?? '') : null;
+    if (client && client[1] !== device.app_version) await db.run('UPDATE devices SET last_seen_at = ?, app_version = ? WHERE id = ?', now(), client[1], device.id);
+    else await db.run('UPDATE devices SET last_seen_at = ? WHERE id = ?', now(), device.id);
     c.set('device', device);
     await next();
   });

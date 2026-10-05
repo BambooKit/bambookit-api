@@ -59,6 +59,8 @@ const envSchema = z.object({
   TELEGRAM_ADMIN_CHAT_IDS: z.string().optional(),
   // Secret Telegram sends with every webhook call; derived from the bot token when not set.
   TELEGRAM_WEBHOOK_SECRET: z.string().optional(),
+  // IANA time zone for the bot's "today / 7 d / 30 d" windows, times shown and the 09:00 daily report.
+  TELEGRAM_TIMEZONE: z.string().default('Asia/Kolkata'),
 
   // Payments through Cashfree (optional; checkout answers 503 PAYMENTS_NOT_CONFIGURED until both are set).
   // Cashfree dashboard -> Developers -> API keys. Never logged or returned.

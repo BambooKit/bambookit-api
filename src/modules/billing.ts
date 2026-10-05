@@ -207,7 +207,7 @@ export async function assertDesktopAllowed(userId: string) {
 // ---------------------------------------------------------------- granting
 
 /** Extends Pro by `ms` from max(now, current pro_until). Call inside a transaction. */
-async function extendPro(q: Queryable, userId: string, ms: number, source: 'payment' | 'reward') {
+async function extendPro(q: Queryable, userId: string, ms: number, source: PlanSource) {
   const row = await q.get<{ pro_until: string | null; pro_source: string | null }>('SELECT pro_until, pro_source FROM users WHERE id = ?', userId);
   const current = row?.pro_until ? Date.parse(row.pro_until) : 0;
   const active = current > Date.now();
@@ -216,6 +216,38 @@ async function extendPro(q: Queryable, userId: string, ms: number, source: 'paym
   const nextSource = active && row?.pro_source === 'payment' ? 'payment' : source;
   await q.run('UPDATE users SET pro_until = ?, pro_source = ? WHERE id = ?', until, nextSource, userId);
   return until;
+}
+
+/**
+ * Admin grant (Telegram panel): extends Pro by `days` and records source 'admin'. It is never recorded as
+ * a paid order. A running paid subscription keeps its 'payment' label. Emits 'plan.updated'.
+ */
+export async function adminGrantPro(userId: string, days: number) {
+  if (!Number.isFinite(days) || days <= 0 || days > 3660) throw new HttpError(400, 'BAD_REQUEST', 'Invalid number of days.');
+  const until = await db.tx(async (q) => {
+    if (!(await q.get('SELECT 1 AS ok FROM users WHERE id = ?', userId))) return null;
+    return extendPro(q, userId, days * 86_400_000, 'admin');
+  });
+  if (!until) throw notFound('User');
+  logger.info('admin granted pro', { userId, days });
+  await planChanged(userId);
+  return until;
+}
+
+/** Admin removal: ends any running Pro time now (payment, reward or admin), keeps the source label. Emits 'plan.updated'. */
+export async function adminRemovePro(userId: string) {
+  const at = now();
+  const res = await db.run('UPDATE users SET pro_until = ? WHERE id = ? AND pro_until > ?', at, userId, at);
+  logger.info('admin removed pro', { userId, changed: res.changes });
+  await planChanged(userId);
+  return res.changes === 1;
+}
+
+type PaymentFailedListener = (p: { amount: number; currency: string; productName: string; email: string | null; environment: string; reason: string }) => void;
+let onPaymentFailed: PaymentFailedListener | null = null;
+/** Set by the Telegram bot to announce failed or abandoned payments. */
+export function setPaymentFailedListener(fn: PaymentFailedListener | null) {
+  onPaymentFailed = fn;
 }
 
 type PaymentListener = (p: { amount: number; currency: string; productId: string; productName: string; email: string | null; environment: string }) => void;
@@ -461,7 +493,12 @@ billingRouter.post('/billing/cashfree/webhook', async (c) => {
   }
   if (event.type === 'PAYMENT_FAILED_WEBHOOK' || event.type === 'PAYMENT_USER_DROPPED_WEBHOOK') {
     // The customer may still retry the same order; a later success replaces FAILED with PAID.
-    await db.run("UPDATE billing_orders SET status = 'FAILED' WHERE id = ? AND status = 'PENDING'", order.id);
+    const failed = await db.run("UPDATE billing_orders SET status = 'FAILED' WHERE id = ? AND status = 'PENDING'", order.id);
+    if (failed.changes === 1 && onPaymentFailed) {
+      const email = (await db.get<{ email: string | null }>('SELECT email FROM users WHERE id = ?', order.user_id))?.email ?? null;
+      const reason = event.type === 'PAYMENT_USER_DROPPED_WEBHOOK' ? 'dropped by the customer' : String(payment.payment_message ?? payment.payment_status ?? 'failed').slice(0, 120);
+      onPaymentFailed({ amount: Number(order.amount_paise) / 100, currency: order.currency, productName: PRODUCTS[order.product_id]?.name ?? order.product_id, email, environment: cashfreeEnvironment(), reason });
+    }
   }
   return c.json({ ok: true });
 });

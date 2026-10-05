@@ -1090,44 +1090,394 @@ describe('admin panel and Telegram monitoring', () => {
     expect(users.json.data[0]).toHaveProperty('email');
   });
 
-  it('answers the Telegram webhook only with the secret, and only admin chats get data', async () => {
-    const { webhookSecret } = await import('../src/services/telegram.js');
-    const sent: any[] = [];
+});
+
+describe('Telegram admin panel', () => {
+  type Sent = { method: string; body: any };
+  const ADMIN_CHAT = 111;
+
+  /** Captures Telegram API calls (and answers GitHub release lookups) while `fn` runs. */
+  async function withTelegram<T>(fn: (sent: Sent[]) => Promise<T>): Promise<T> {
+    const tg = await import('../src/services/telegram.js');
+    tg.telegramLimits.perChatMs = 0;
+    const sent: Sent[] = [];
     const realFetch = globalThis.fetch;
-    globalThis.fetch = (async (url: any, init: any) => {
-      if (String(url).startsWith('https://api.telegram.org/')) {
-        sent.push({ method: String(url).split('/').pop(), body: JSON.parse(init.body) });
-        return new Response(JSON.stringify({ ok: true, result: {} }), { headers: { 'Content-Type': 'application/json' } });
+    globalThis.fetch = (async (url: any, init: any = {}) => {
+      const u = String(url);
+      if (u.startsWith('https://api.telegram.org/')) {
+        const method = u.split('/').pop()!;
+        sent.push({ method, body: JSON.parse(init.body) });
+        const result = method === 'getWebhookInfo' ? { url: 'https://x/telegram/webhook', pending_update_count: 3, last_error_message: 'Read timeout expired', last_error_date: 1_800_000_000 } : {};
+        return Response.json({ ok: true, result });
+      }
+      if (u.startsWith('https://api.github.com/repos/')) {
+        return Response.json({ tag_name: u.includes('android') ? 'v1.0.9' : 'v1.0.5', name: 'r', published_at: null, body: '', html_url: 'https://github.com', assets: [] });
       }
       return realFetch(url, init);
     }) as typeof fetch;
     try {
-      const post = (secret: string | null, chatId: number, text: string) =>
-        app.request('http://localhost/telegram/webhook', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...(secret ? { 'X-Telegram-Bot-Api-Secret-Token': secret } : {}) },
-          body: JSON.stringify({ update_id: 1, message: { chat: { id: chatId }, text } }),
-        });
-      expect((await post(null, 111, '/start')).status).toBe(403);
-      expect((await post('wrong', 111, '/start')).status).toBe(403);
-      expect(sent).toHaveLength(0);
-
-      // A stranger only learns their own chat id.
-      expect((await post(webhookSecret, 999, '📊 Status')).status).toBe(200);
-      expect(sent[0].body.chat_id).toBe(999);
-      expect(sent[0].body.text).toContain('private');
-      expect(sent[0].body.text).not.toContain('Requests');
-
-      // The admin chat gets the button menu and real numbers.
-      await post(webhookSecret, 111, '👥 Users');
-      const reply = sent.at(-1);
-      expect(reply.body.chat_id).toBe(111);
-      expect(reply.body.text).toContain('Users');
-      expect(reply.body.reply_markup.keyboard.flat().map((b: any) => b.text)).toContain('📊 Status');
-      for (const s of sent) expect(JSON.stringify(s.body)).not.toContain('test-bot-token');
+      return await fn(sent);
     } finally {
       globalThis.fetch = realFetch;
+      // The bot token never appears in any request body.
+      for (const s of sent) expect(JSON.stringify(s.body)).not.toContain('test-bot-token');
     }
+  }
+
+  async function post(update: unknown, secret?: string | null) {
+    const { webhookSecret } = await import('../src/services/telegram.js');
+    const s = secret === undefined ? webhookSecret : secret;
+    return app.request('http://localhost/telegram/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(s ? { 'X-Telegram-Bot-Api-Secret-Token': s } : {}) },
+      body: JSON.stringify(update),
+    });
+  }
+  let updateId = 1000;
+  const type = (text: string, chatId = ADMIN_CHAT) => post({ update_id: ++updateId, message: { message_id: updateId, chat: { id: chatId }, from: { id: chatId }, text } });
+  const press = (data: string, chatId = ADMIN_CHAT, messageId = 500) =>
+    post({ update_id: ++updateId, callback_query: { id: `cq${updateId}`, from: { id: chatId }, data, message: { message_id: messageId, chat: { id: chatId } } } });
+  const buttons = (body: any): Array<{ text: string; callback_data: string }> => (body?.reply_markup?.inline_keyboard ?? []).flat();
+  const lastOf = (sent: Sent[], method: string) => [...sent].reverse().find((s) => s.method === method)!;
+  const userIdOf = async (token: string) => (await call('GET', '/v1/me', { token })).json.data.id as string;
+
+  it('still requires the webhook secret, tells strangers only their chat id and rejects their buttons', async () => {
+    await withTelegram(async (sent) => {
+      expect((await post({ update_id: 1, message: { chat: { id: ADMIN_CHAT }, text: '/start' } }, null)).status).toBe(403);
+      expect((await post({ update_id: 1, message: { chat: { id: ADMIN_CHAT }, text: '/start' } }, 'wrong')).status).toBe(403);
+      expect((await post({ update_id: 1, callback_query: { id: 'x', data: 'd', message: { message_id: 1, chat: { id: ADMIN_CHAT } } } }, 'wrong')).status).toBe(403);
+      expect(sent).toHaveLength(0);
+
+      expect((await type('📊 Dashboard', 999)).status).toBe(200);
+      expect(sent).toHaveLength(1);
+      expect(sent[0].body).toEqual({ chat_id: 999, text: expect.stringContaining('Your chat id is 999') });
+
+      // A stranger pressing an old admin button gets nothing but their chat id; nothing is edited.
+      await press('d', 999);
+      await press('ux:whatever', 999);
+      expect(sent.filter((s) => s.method === 'editMessageText')).toHaveLength(0);
+      const answers = sent.filter((s) => s.method === 'answerCallbackQuery');
+      expect(answers).toHaveLength(2);
+      for (const a of answers) {
+        expect(a.body.text).toContain('private');
+        expect(a.body.text).not.toMatch(/Users|Revenue|Requests/);
+      }
+
+      // The admin gets the short reply keyboard and the inline main menu.
+      sent.length = 0;
+      await type('/start');
+      expect(sent.map((s) => s.method)).toEqual(['sendMessage', 'sendMessage']);
+      expect(sent[0].body.reply_markup.keyboard.flat().map((b: any) => b.text)).toEqual(['📋 Menu', '📊 Dashboard', '👥 Users', '⚠️ Errors']);
+      expect(buttons(sent[1].body).map((b) => b.text)).toEqual(['📊 Dashboard', '👥 Users', '💻 Devices', '🤖 Sessions', '💰 Revenue', '🏆 Achievements', '⚠️ Errors', '🩺 Health', '🔔 Alerts', '⚙️ Settings']);
+      for (const s of sent) expect(s.body.chat_id).toBe(ADMIN_CHAT);
+    });
+  });
+
+  it('navigates with inline buttons by editing the message in place, with Refresh and Menu on every screen', async () => {
+    await withTelegram(async (sent) => {
+      const { MENU } = await import('../src/services/telegram-ui.js');
+      for (const [label, data] of MENU) {
+        sent.length = 0;
+        expect((await press(data)).status).toBe(200);
+        expect(sent.filter((s) => s.method === 'sendMessage')).toHaveLength(0);
+        const edit = lastOf(sent, 'editMessageText');
+        expect(edit.body).toMatchObject({ chat_id: ADMIN_CHAT, message_id: 500, parse_mode: 'HTML' });
+        expect(edit.body.text.length).toBeLessThanOrEqual(4096);
+        expect(edit.body.text).toContain(label.split(' ').slice(1).join(' ').replace('Errors', 'errors'));
+        expect(edit.body.text).toMatch(/as of \d\d:\d\d · Asia\/Kolkata/);
+        const texts = buttons(edit.body).map((b) => b.text);
+        expect(texts).toContain('🔄 Refresh');
+        expect(texts).toContain('⬅️ Menu');
+        for (const b of buttons(edit.body)) expect(Buffer.byteLength(b.callback_data)).toBeLessThanOrEqual(64);
+        // answerCallbackQuery always follows.
+        expect(sent.at(-1)!.method).toBe('answerCallbackQuery');
+      }
+      // Menu returns to the main menu; the health screen shows the webhook state.
+      await press('hl');
+      expect(lastOf(sent, 'editMessageText').body.text).toContain('3 pending updates');
+      expect(lastOf(sent, 'editMessageText').body.text).toContain('Read timeout expired');
+      await press('m');
+      expect(lastOf(sent, 'editMessageText').body.text).toContain('BambooKit admin');
+      // Reply-keyboard shortcuts open the same screens as new messages.
+      sent.length = 0;
+      await type('📊 Dashboard');
+      expect(sent[0].method).toBe('sendMessage');
+      expect(sent[0].body.text).toContain('Dashboard');
+      expect(buttons(sent[0].body).map((b) => b.text)).toContain('🔄 Refresh');
+    });
+  });
+
+  it('pages through users newest first, 8 per page, and opens a user card', async () => {
+    await withTelegram(async (sent) => {
+      for (let i = 0; i < 9; i++) await userIdOf(await tokenFor(`user-tgpage-${i}`, `tgpage${i}@example.com`));
+      const total = Number((await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM users'))!.n);
+      await press('u:0');
+      const first = lastOf(sent, 'editMessageText').body;
+      const userButtons = buttons(first).filter((b) => b.callback_data.startsWith('uc:'));
+      expect(userButtons).toHaveLength(8);
+      expect(first.text).toContain(`Users</b> ${total}`);
+      expect(buttons(first).map((b) => b.text)).toContain(`1 / ${Math.ceil(total / 8)}`);
+      expect(buttons(first).find((b) => b.text === '▶')!.callback_data).toBe('u:1');
+      expect(buttons(first).find((b) => b.text === '◀')).toBeUndefined();
+      // Newest first: created_at descending.
+      const newest = await db.all<{ id: string }>('SELECT id FROM users ORDER BY created_at DESC, id DESC LIMIT 8');
+      expect(userButtons.map((b) => b.callback_data.slice(3))).toEqual(newest.map((r) => r.id));
+
+      await press('u:1');
+      const second = lastOf(sent, 'editMessageText').body;
+      expect(buttons(second).map((b) => b.text)).toContain(`2 / ${Math.ceil(total / 8)}`);
+      expect(buttons(second).find((b) => b.text === '◀')!.callback_data).toBe('u:0');
+      const secondIds = buttons(second).filter((b) => b.callback_data.startsWith('uc:')).map((b) => b.callback_data);
+      expect(secondIds.some((id) => userButtons.some((b) => b.callback_data === id))).toBe(false);
+
+      await press(userButtons[0].callback_data);
+      const card = lastOf(sent, 'editMessageText').body;
+      expect(card.text).toContain('Plan');
+      expect(buttons(card).map((b) => b.text)).toEqual(expect.arrayContaining(['🎁 Pro 7 d', '🎁 Pro 30 d', '🔄 Refresh', '⬅️ Menu']));
+    });
+  });
+
+  it('finds users by partial email (case-insensitive) or id from typed text and /user', async () => {
+    await withTelegram(async (sent) => {
+      const token = await tokenFor('user-tgsearch-1', 'Search.Person@Example.com');
+      const id = await userIdOf(token);
+      await userIdOf(await tokenFor('user-tgsearch-2', 'other.person@example.com'));
+
+      await type('search.PERSON');
+      let msg = lastOf(sent, 'sendMessage').body;
+      expect(buttons(msg).filter((b) => b.callback_data.startsWith('uc:')).map((b) => b.callback_data)).toEqual([`uc:${id}`]);
+      // Admins see full emails inside admin screens.
+      expect(msg.text).toContain('Search.Person@Example.com');
+
+      await type('/user person@EXAMPLE');
+      msg = lastOf(sent, 'sendMessage').body;
+      const ids = buttons(msg).filter((b) => b.callback_data.startsWith('uc:')).map((b) => b.callback_data);
+      expect(ids).toEqual(expect.arrayContaining([`uc:${id}`]));
+      expect(ids.length).toBeGreaterThanOrEqual(2);
+
+      await type(id);
+      expect(buttons(lastOf(sent, 'sendMessage').body).filter((b) => b.callback_data.startsWith('uc:'))[0].callback_data).toBe(`uc:${id}`);
+
+      // At most 8 results.
+      await type('@example.com');
+      expect(buttons(lastOf(sent, 'sendMessage').body).filter((b) => b.callback_data.startsWith('uc:')).length).toBe(8);
+
+      await type('no-such-user-anywhere');
+      expect(lastOf(sent, 'sendMessage').body.text).toContain('No matching users');
+    });
+  });
+
+  it('grants and removes Pro only after confirmation, emits plan.updated and records admin actions', async () => {
+    await withTelegram(async (sent) => {
+      const token = await tokenFor('user-tggrant', 'grant.me@gmail.com');
+      const id = await userIdOf(token);
+      const bus = await import('../src/realtime/bus.js');
+      const events: any[] = [];
+      const off = bus.subscribe(id, (e) => e.type === 'plan.updated' && events.push(e));
+      try {
+        await press(`ua:g30:${id}`);
+        const ask = lastOf(sent, 'editMessageText').body;
+        expect(ask.text).toContain('Grant 30 days of Pro');
+        const confirm = buttons(ask).find((b) => b.text === '✅ Confirm')!;
+        expect(confirm.callback_data).toMatch(/^ux:/);
+        expect(buttons(ask).find((b) => b.text === '✖️ Cancel')!.callback_data).toBe(`uc:${id}`);
+        // Asking changes nothing.
+        expect(events).toHaveLength(0);
+        expect((await call('GET', '/v1/me/plan', { token })).json.data.plan).toBe('free');
+
+        // Another chat cannot use the confirmation.
+        await press(confirm.callback_data, 999);
+        expect(events).toHaveLength(0);
+
+        const before = Date.now();
+        await press(confirm.callback_data);
+        expect(lastOf(sent, 'editMessageText').body.text).toContain('Granted 30 days of Pro');
+        expect(events).toHaveLength(1);
+        expect(events[0].payload).toMatchObject({ plan: 'pro', source: 'admin' });
+        const plan = (await call('GET', '/v1/me/plan', { token })).json.data;
+        expect(plan).toMatchObject({ plan: 'pro', source: 'admin' });
+        expect(Date.parse(plan.proUntil) - before).toBeGreaterThanOrEqual(30 * 86_400_000 - 5000);
+        // Not a paid order.
+        expect(Number((await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM billing_orders WHERE user_id = ?', id))!.n)).toBe(0);
+
+        // A second tap on the same Confirm does nothing.
+        await press(confirm.callback_data);
+        expect(lastOf(sent, 'answerCallbackQuery').body.text).toContain('expired');
+        expect(events).toHaveLength(1);
+        expect((await call('GET', '/v1/me/plan', { token })).json.data.proUntil).toBe(plan.proUntil);
+
+        // Remove Pro (also confirmed).
+        await press(`uc:${id}`);
+        expect(buttons(lastOf(sent, 'editMessageText').body).map((b) => b.text)).toContain('⛔ Remove Pro');
+        await press(`ua:rm:${id}`);
+        const rm = buttons(lastOf(sent, 'editMessageText').body).find((b) => b.text === '✅ Confirm')!;
+        expect(events).toHaveLength(1);
+        await press(rm.callback_data);
+        expect(events).toHaveLength(2);
+        expect(events[1].payload).toMatchObject({ plan: 'free', source: null });
+        expect((await call('GET', '/v1/me/plan', { token })).json.data.plan).toBe('free');
+
+        const actions = await db.all<any>('SELECT actor, action, target_user_id, detail FROM admin_actions WHERE target_user_id = ? ORDER BY created_at', id);
+        expect(actions.map((a) => [a.actor, a.action, a.target_user_id])).toEqual([
+          ['telegram:111', 'pro.grant', id],
+          ['telegram:111', 'pro.remove', id],
+        ]);
+        expect(JSON.parse(actions[0].detail)).toMatchObject({ days: 30 });
+        for (const a of actions) expect(JSON.stringify(a)).not.toContain('test-bot-token');
+      } finally {
+        off();
+      }
+    });
+  });
+
+  it('counts days in the admin time zone (23:30 IST belongs to that IST day)', async () => {
+    const panel = await import('../src/modules/admin-panel.js');
+    // 11 Mar 2030 11:30 IST.
+    const at = new Date('2030-03-11T06:00:00Z');
+    const rows = [
+      ['tz-late', '2030-03-10T18:00:00.000Z'], // 10 Mar 23:30 IST → yesterday (IST), same UTC day
+      ['tz-early', '2030-03-10T19:00:00.000Z'], // 11 Mar 00:30 IST → today (IST), although 10 Mar in UTC
+      ['tz-week', '2030-03-04T19:00:00.000Z'], // 5 Mar 00:30 IST → first of the last 7 IST days (5–11 Mar)
+      ['tz-old', '2030-03-04T18:00:00.000Z'], // 4 Mar 23:30 IST → outside
+      ['tz-future', '2030-03-11T07:00:00.000Z'], // after `at`
+    ];
+    for (const [id, created] of rows) await db.run('INSERT INTO users (id, email, created_at, last_seen_at) VALUES (?, ?, ?, ?)', id, `${id}@example.com`, created, created);
+    try {
+      const d = await panel.dashboard(panel.context(at));
+      expect(d.users.new).toMatchObject({ today: 1, yesterday: 1, d7: 3 });
+      expect(d.users.dau).toBeGreaterThanOrEqual(1);
+      expect(d.tz).toBe('Asia/Kolkata');
+      // The daily report for 11 Mar (sent 12 Mar 09:30 IST) counts 11 Mar IST sign-ups; the 23:30 one is 10 Mar.
+      const report = await panel.dailyReport(new Date('2030-03-12T04:00:00Z'));
+      expect(report).toMatchObject({ day: '2030-03-11', newUsers: 2, newUsersPrev: 1 });
+    } finally {
+      for (const [id] of rows) await db.run('DELETE FROM users WHERE id = ?', id);
+    }
+  });
+
+  it('sums revenue from amount_paise for PAID INR orders only', async () => {
+    const panel = await import('../src/modules/admin-panel.js');
+    const at = new Date('2031-06-15T06:00:00Z'); // 11:30 IST
+    const orders: Array<[string, number, string, string, string | null, string]> = [
+      ['ord_tg_1', 19_900, 'INR', 'PAID', '2031-06-15T04:00:00.000Z', '2031-06-15T03:59:00.000Z'], // today
+      ['ord_tg_2', 199_900, 'INR', 'PAID', '2031-06-13T10:00:00.000Z', '2031-06-13T09:59:00.000Z'], // 7 d
+      ['ord_tg_3', 19_900, 'INR', 'PENDING', null, '2031-06-15T02:00:00.000Z'],
+      ['ord_tg_4', 19_900, 'INR', 'FAILED', null, '2031-06-14T02:00:00.000Z'],
+      ['ord_tg_5', 5_000, 'USD', 'PAID', '2031-06-15T04:30:00.000Z', '2031-06-15T04:29:00.000Z'], // not INR
+      ['ord_tg_6', 19_900, 'INR', 'PAID', '2031-06-14T18:20:00.000Z', '2031-06-14T18:19:00.000Z'], // 14 Jun 23:50 IST → yesterday
+    ];
+    for (const [id, paise, cur, status, paid, created] of orders) {
+      await db.run('INSERT INTO billing_orders (id, user_id, product_id, amount_paise, currency, status, created_at, paid_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', id, 'user-tgrev', 'pro-month', paise, cur, status, created, paid);
+    }
+    try {
+      const r = await panel.revenueScreen(panel.context(at));
+      expect(r.paise.today).toBe(19_900);
+      expect(r.paise.yesterday).toBe(19_900);
+      expect(r.paise.d7).toBe(19_900 + 199_900 + 19_900);
+      expect(r.paidCount.today).toBe(1);
+      expect(r.byStatus).toMatchObject({ PAID: 4, PENDING: 1, FAILED: 1 });
+      expect(r.checkouts).toBe(6);
+      expect(r.conversion).toBeCloseTo((4 / 6) * 100);
+      const { revenueScreenView } = await import('../src/services/telegram-ui.js');
+      const view = revenueScreenView(r).text;
+      expect(view).toContain('Today ₹199.00 (1)');
+      expect(view).toContain('₹2,397.00');
+    } finally {
+      for (const [id] of orders) await db.run('DELETE FROM billing_orders WHERE id = ?', id);
+    }
+  });
+
+  it('sends the daily report once per admin-zone day at 09:00, and Send report now works', async () => {
+    await withTelegram(async (sent) => {
+      const tg = await import('../src/services/telegram.js');
+      expect(await tg.checkDailyReport(new Date('2032-01-05T03:00:00Z'))).toBe(false); // 08:30 IST
+      expect(sent).toHaveLength(0);
+      expect(await tg.checkDailyReport(new Date('2032-01-05T03:40:00Z'))).toBe(true); // 09:10 IST
+      expect(sent).toHaveLength(1);
+      expect(sent[0].body).toMatchObject({ chat_id: '111', parse_mode: 'HTML' });
+      expect(sent[0].body.text).toContain('Daily report');
+      expect(sent[0].body.text).toContain('2032-01-04');
+      expect(await tg.checkDailyReport(new Date('2032-01-05T10:00:00Z'))).toBe(false);
+      // Survives a restart: the date is stored.
+      tg.reloadTelegramSettings();
+      expect(await tg.checkDailyReport(new Date('2032-01-05T12:00:00Z'))).toBe(false);
+      expect(sent).toHaveLength(1);
+      expect(await tg.checkDailyReport(new Date('2032-01-06T03:31:00Z'))).toBe(true);
+      expect(sent).toHaveLength(2);
+      expect(sent[1].body.text).toContain('2032-01-05');
+
+      sent.length = 0;
+      await press('sr');
+      expect(sent.filter((s) => s.method === 'sendMessage' && s.body.text.includes('Daily report'))).toHaveLength(1);
+      expect(lastOf(sent, 'editMessageText').body.text).toContain('Report sent');
+      expect(lastOf(sent, 'editMessageText').body.text).toContain('last sent 2032-01-06');
+      const logged = await db.get<any>("SELECT actor FROM admin_actions WHERE action = 'report.send'");
+      expect(logged.actor).toBe('telegram:111');
+    });
+  });
+
+  it('persists alert toggles and settings, and masks emails in alerts', async () => {
+    await withTelegram(async (sent) => {
+      const tg = await import('../src/services/telegram.js');
+      expect(await tg.alertEnabled('signup')).toBe(true);
+      await press('at:signup');
+      expect(lastOf(sent, 'editMessageText').body.text).toContain('🔕 🆕 New sign-ups');
+      tg.reloadTelegramSettings();
+      expect(await tg.alertEnabled('signup')).toBe(false);
+      expect((await db.get<any>("SELECT value FROM telegram_settings WHERE key = 'alert.signup'")).value).toBe('0');
+
+      sent.length = 0;
+      await tg.alert('signup', tg.signupAlertText({ email: 'jane.doe@gmail.com', provider: 'google' }));
+      expect(sent).toHaveLength(0);
+      await press('at:signup');
+      tg.reloadTelegramSettings();
+      expect(await tg.alertEnabled('signup')).toBe(true);
+      sent.length = 0;
+      await tg.alert('signup', tg.signupAlertText({ email: 'jane.doe@gmail.com', provider: 'google' }));
+      expect(sent).toHaveLength(1);
+      expect(sent[0].body.text).toContain('j***@gmail.com');
+      expect(sent[0].body.text).not.toContain('jane.doe');
+      expect(tg.paymentFailedAlertText({ amount: 199, currency: 'INR', productName: 'Pro', email: 'payer@x.com', environment: 'sandbox', reason: 'dropped by the customer' })).toContain('p***@x.com');
+
+      await press('sp:25');
+      tg.reloadTelegramSettings();
+      await press('st');
+      const settings = lastOf(sent, 'editMessageText').body;
+      expect(settings.text).toContain('more than 25 server errors');
+      expect(buttons(settings).map((b) => b.text)).toContain('• Spike > 25');
+      await press('sp:10');
+    });
+  });
+
+  it('splits long messages at 4096 characters and escapes HTML', async () => {
+    const tg = await import('../src/services/telegram.js');
+    const { esc } = await import('../src/services/telegram-ui.js');
+    const long = Array.from({ length: 300 }, (_, i) => `<b>line ${i}</b> ${'x'.repeat(40)}`).join('\n');
+    const parts = tg.splitMessage(long);
+    expect(parts.length).toBeGreaterThan(1);
+    for (const p of parts) expect(p.length).toBeLessThanOrEqual(4096);
+    expect(parts.join('\n')).toBe(long);
+    expect(esc('<script>&"')).toBe('&lt;script&gt;&amp;&quot;');
+  });
+
+  it('shows phone app versions reported in X-BK-Client and flags PCs that need an update', async () => {
+    await withTelegram(async (sent) => {
+      const token = await tokenFor('user-tgdev', 'tgdev@example.com');
+      const desktop = await setupDesktop(token); // 1.0.3, latest mocked as 1.0.5
+      const { mobileId } = await pairPhone(token, desktop);
+      const controller = new AbortController();
+      const res = await app.request('http://localhost/v1/realtime/stream', { headers: { Authorization: `Bearer ${token}`, 'X-BK-Device-Id': mobileId, 'X-BK-Client': 'android/1.2.3' }, signal: controller.signal });
+      expect(res.status).toBe(200);
+      controller.abort();
+      await res.body?.cancel().catch(() => {});
+      expect((await db.get<any>('SELECT app_version FROM devices WHERE id = ?', mobileId)).app_version).toBe('1.2.3');
+
+      await press('dv');
+      const text = lastOf(sent, 'editMessageText').body.text;
+      expect(text).toMatch(/Latest release: 1\.0\.5 · \d+ need an update/);
+      expect(text).toContain('1.2.3');
+      expect(text).toContain('t***@example.com');
+    });
   });
 });
 

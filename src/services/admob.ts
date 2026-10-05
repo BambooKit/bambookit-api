@@ -23,6 +23,16 @@ const defaultLoader: VerifierKeyLoader = async () => {
 
 let loader: VerifierKeyLoader = defaultLoader;
 let cache: { at: number; keys: Map<string, KeyObject> } | null = null;
+let lastLoadError: { at: number; message: string } | null = null;
+
+/** Cached verifier-key state for the admin health screen (no network call). */
+export function verifierKeysState() {
+  return {
+    loadedAt: cache ? new Date(cache.at).toISOString() : null,
+    keys: cache?.keys.size ?? 0,
+    lastError: lastLoadError ? { at: new Date(lastLoadError.at).toISOString(), message: lastLoadError.message } : null,
+  };
+}
 
 /** Tests inject their own key source (pass null to restore Google's). */
 export function setVerifierKeyLoader(fn: VerifierKeyLoader | null) {
@@ -41,6 +51,7 @@ async function load() {
     }
   }
   cache = { at: Date.now(), keys };
+  lastLoadError = null;
 }
 
 async function keyFor(keyId: string): Promise<KeyObject | null> {
@@ -50,6 +61,7 @@ async function keyFor(keyId: string): Promise<KeyObject | null> {
     try {
       await load();
     } catch (err: any) {
+      lastLoadError = { at: Date.now(), message: String(err?.message ?? err).slice(0, 200) };
       logger.warn('admob verifier keys unavailable', { error: String(err?.message ?? err).slice(0, 200) });
     }
   }

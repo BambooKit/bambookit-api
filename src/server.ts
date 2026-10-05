@@ -4,10 +4,7 @@ import { env, VERSION } from './config/env.js';
 import { logger } from './lib/logger.js';
 import { sweepExpiredSnapshots } from './modules/history.js';
 import { storage } from './services/storage.js';
-import { alert, startTelegram, telegramEnabled } from './services/telegram.js';
-import { setNewUserListener } from './middleware/auth.js';
-import { setPaymentListener } from './modules/billing.js';
-import { paymentAlertText } from './services/telegram.js';
+import { startTelegram, telegramEnabled } from './services/telegram.js';
 
 logger.info(`Starting BambooKit API v${VERSION}`, {
   port: env.PORT,
@@ -21,11 +18,9 @@ serve({ fetch: app.fetch, port: env.PORT, hostname: '::' }, (info) => {
   logger.info(`BambooKit API listening on http://localhost:${info.port}`);
 });
 
+// Telegram admin bot: webhook, commands, alerts (sign-ups, payments, errors) and the 09:00 daily report.
 if (telegramEnabled) {
-  setNewUserListener((u) => alert(`🆕 <b>New BambooKit user</b>
-${(u.email ?? '(no email)').replace(/[<>&]/g, '')} · ${u.provider}`));
-  setPaymentListener((p) => alert(paymentAlertText(p)));
-  void startTelegram(process.env.PUBLIC_API_URL ?? process.env.RENDER_EXTERNAL_URL);
+  void startTelegram(process.env.PUBLIC_API_URL ?? process.env.RENDER_EXTERNAL_URL).catch((err) => logger.warn('telegram start failed', { error: String(err?.message ?? err).slice(0, 200) }));
 }
 
 // Render's free tier stops a web service after 15 minutes without inbound traffic. Requesting our

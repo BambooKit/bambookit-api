@@ -422,6 +422,28 @@ async function migrate(d: Database) {
     used INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, day, metric)
   )`);
+  // Telegram admin bot: settings that survive restarts (alert toggles, last daily report date), an audit
+  // log of admin actions (who, what, which user — never secrets) and active days in the admin time zone.
+  await d.run(`CREATE TABLE IF NOT EXISTS telegram_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`);
+  await d.run(`CREATE TABLE IF NOT EXISTS admin_actions (
+    id TEXT PRIMARY KEY,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_user_id TEXT,
+    detail TEXT,
+    created_at TEXT NOT NULL
+  )`);
+  await d.run('CREATE INDEX IF NOT EXISTS admin_actions_created ON admin_actions(created_at)');
+  await d.run(`CREATE TABLE IF NOT EXISTS user_active_days (
+    user_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    PRIMARY KEY (user_id, day)
+  )`);
+  await d.run('CREATE INDEX IF NOT EXISTS user_active_days_day ON user_active_days(day)');
   // Session chats, diffs and activity now live only on the PC; remove copies stored by earlier versions.
   await d.run('DELETE FROM session_parts');
   await d.run('DELETE FROM session_diffs');
