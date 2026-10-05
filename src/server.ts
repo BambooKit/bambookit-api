@@ -6,6 +6,8 @@ import { sweepExpiredSnapshots } from './modules/history.js';
 import { storage } from './services/storage.js';
 import { alert, startTelegram, telegramEnabled } from './services/telegram.js';
 import { setNewUserListener } from './middleware/auth.js';
+import { setPaymentListener } from './modules/billing.js';
+import { paymentAlertText } from './services/telegram.js';
 
 logger.info(`Starting BambooKit API v${VERSION}`, {
   port: env.PORT,
@@ -22,6 +24,7 @@ serve({ fetch: app.fetch, port: env.PORT, hostname: '::' }, (info) => {
 if (telegramEnabled) {
   setNewUserListener((u) => alert(`🆕 <b>New BambooKit user</b>
 ${(u.email ?? '(no email)').replace(/[<>&]/g, '')} · ${u.provider}`));
+  setPaymentListener((p) => alert(paymentAlertText(p)));
   void startTelegram(process.env.PUBLIC_API_URL ?? process.env.RENDER_EXTERNAL_URL);
 }
 

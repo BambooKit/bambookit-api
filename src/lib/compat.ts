@@ -8,7 +8,7 @@ import { HttpError } from './http.js';
  * the capabilities of their app version (see LEGACY below), so nothing is ever sent to a PC that cannot
  * handle it — in particular, encrypted provider keys only go to PCs that publish an encryption key.
  */
-export const API_VERSION = '1.1.0';
+export const API_VERSION = '1.2.0';
 export const PROTOCOL_VERSION = 2;
 
 export type Capability =

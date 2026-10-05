@@ -25,3 +25,13 @@ services:
         value: https://bambookit-web.onrender.com
       - key: CORS_ORIGINS
         value: https://bambookit-web.onrender.com,http://localhost:3000
+      # Payments (Cashfree). Webhook URL: https://<this service>/v1/billing/cashfree/webhook
+      - key: CASHFREE_APP_ID
+        sync: false
+      - key: CASHFREE_SECRET_KEY
+        sync: false
+      - key: CASHFREE_ENV
+        value: sandbox
+      # Rewarded ads: AdMob SSV callback URL https://<this service>/v1/rewards/admob-ssv
+      - key: REWARD_SIGNING_SECRET
+        sync: false

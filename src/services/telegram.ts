@@ -11,8 +11,9 @@ import { adminSnapshot, recentUsers } from '../modules/admin.js';
  * - Only chats listed in TELEGRAM_ADMIN_CHAT_IDS can use it; anyone else only learns their own chat id
  *   (so the owner can add it) and nothing about the service.
  * - Buttons instead of typed commands (a reply keyboard): Status, Users, Devices, Sessions, Errors,
- *   New sign-ups, Alerts on/off.
- * - Alerts: API started, new sign-ups, server errors (at most one error alert per 5 minutes).
+ *   New sign-ups, Revenue, Alerts on/off.
+ * - Alerts: API started, new sign-ups, payments (amount and product, masked email only), server errors
+ *   (at most one error alert per 5 minutes).
  * - Telegram calls us through a webhook that must carry the secret token; the bot token itself is never
  *   logged or returned.
  */
@@ -32,6 +33,7 @@ const BUTTONS = {
   sessions: '🤖 Sessions',
   errors: '⚠️ Errors',
   signups: '🆕 New sign-ups',
+  revenue: '💰 Revenue',
   alerts: '🔔 Alerts on/off',
 } as const;
 
@@ -40,7 +42,7 @@ const keyboard = {
     [{ text: BUTTONS.status }, { text: BUTTONS.users }],
     [{ text: BUTTONS.devices }, { text: BUTTONS.sessions }],
     [{ text: BUTTONS.errors }, { text: BUTTONS.signups }],
-    [{ text: BUTTONS.alerts }],
+    [{ text: BUTTONS.revenue }, { text: BUTTONS.alerts }],
   ],
   resize_keyboard: true,
   is_persistent: true,
@@ -120,12 +122,35 @@ async function answer(button: string): Promise<string> {
       if (!users.length) return 'No users yet.';
       return ['<b>New sign-ups</b>', ...users.map((u) => `${escape(u.createdAt.slice(0, 16).replace('T', ' '))} · ${escape(u.email ?? '(no email)')} · ${escape(u.provider ?? '')}`)].join('\n');
     }
+    case BUTTONS.revenue: {
+      const b = snap.billing;
+      return [
+        `<b>Revenue</b> · Cashfree ${b.configured ? escape(b.environment) : 'not configured'}`,
+        `Last 30 days: ₹${b.revenue30d.toFixed(2)} from ${b.paidOrders30d} payment${b.paidOrders30d === 1 ? '' : 's'}`,
+        `Active Pro accounts: ${b.activePro}`,
+        `Rewarded ads (24 h): ${b.rewards24h}`,
+      ].join('\n');
+    }
     case BUTTONS.alerts:
       alertsOn = !alertsOn;
       return alertsOn ? '🔔 Alerts are on.' : '🔕 Alerts are off until you turn them on again (or the API restarts).';
     default:
       return 'Choose an option below.';
   }
+}
+
+/** s***@gmail.com — enough to recognise a customer without exposing the address. */
+export function maskEmail(email: string | null): string {
+  if (!email || !email.includes('@')) return '(no email)';
+  const [local, domain] = [email.slice(0, email.lastIndexOf('@')), email.slice(email.lastIndexOf('@') + 1)];
+  return `${local.slice(0, 1)}***@${domain}`;
+}
+
+/** Alert text for a successful payment (wired with setPaymentListener). */
+export function paymentAlertText(p: { amount: number; currency: string; productName: string; email: string | null; environment: string }) {
+  return `💰 <b>Payment received</b>${p.environment === 'sandbox' ? ' (sandbox)' : ''}
+${p.currency === 'INR' ? '₹' : `${escape(p.currency)} `}${p.amount.toFixed(2)} · ${escape(p.productName)}
+${escape(maskEmail(p.email))}`;
 }
 
 export const telegramRouter = new Hono();

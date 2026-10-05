@@ -8,7 +8,7 @@ import { expireStaleCommands } from './commands.js';
 
 export const realtimeRouter = new Hono<AppEnv>();
 
-const ACCOUNT_EVENTS = new Set(['profile.updated', 'account.deleted', 'achievement.unlocked']);
+const ACCOUNT_EVENTS = new Set(['profile.updated', 'account.deleted', 'achievement.unlocked', 'plan.updated']);
 const DESKTOP_EVENTS = new Set(['command.created', 'relay.request', 'pairing.completed', 'device.revoked', 'device.unlinked', 'device.updated']);
 
 /** Which events a stream receives. Desktops only get what they must act on. */

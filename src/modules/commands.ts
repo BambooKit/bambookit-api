@@ -5,6 +5,7 @@ import { requireDevice, requireUser, type AppEnv, type DeviceRow } from '../midd
 import { HttpError, forbidden, newId, notFound } from '../lib/http.js';
 import { emitEphemeral, isConnected, publish } from '../realtime/bus.js';
 import { commandRow, COMMAND_SELECT, serializeCommand } from './serializers.js';
+import { consumeDailyQuota } from './billing.js';
 
 /** Commands older than this are never delivered — a stale remote action must not run hours later. */
 export const COMMAND_TTL_MS = 5 * 60_000;
@@ -68,6 +69,12 @@ export async function createCommand(input: {
     if (!linked) throw forbidden('This phone is not paired with that desktop', 'DEVICE_NOT_PAIRED');
   }
   const payload = commandPayloads[input.type].parse(input.payload ?? {});
+  // Plan limits: chatting and starting sessions from a phone or the website count toward the daily
+  // allowance (desktops do not). Approvals, answers, continue-on-PC, renames and keys are never limited.
+  if (input.issuer?.kind !== 'desktop') {
+    if (input.type === 'SEND_MESSAGE') await consumeDailyQuota(input.userId, 'messages');
+    else if (input.type === 'CREATE_SESSION') await consumeDailyQuota(input.userId, 'sessions');
+  }
   const id = newId('cmd');
   const ts = now();
   await db.run(

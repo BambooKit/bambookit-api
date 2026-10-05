@@ -59,6 +59,18 @@ const envSchema = z.object({
   TELEGRAM_ADMIN_CHAT_IDS: z.string().optional(),
   // Secret Telegram sends with every webhook call; derived from the bot token when not set.
   TELEGRAM_WEBHOOK_SECRET: z.string().optional(),
+
+  // Payments through Cashfree (optional; checkout answers 503 PAYMENTS_NOT_CONFIGURED until both are set).
+  // Cashfree dashboard -> Developers -> API keys. Never logged or returned.
+  CASHFREE_APP_ID: z.string().optional(),
+  CASHFREE_SECRET_KEY: z.string().optional(),
+  CASHFREE_ENV: z.preprocess((v) => (v === '' ? undefined : v), z.enum(['sandbox', 'production']).default('sandbox')),
+  // Page Cashfree returns the buyer to (?order_id=... is appended). Defaults to the BambooKit website.
+  BILLING_RETURN_URL: z.string().url().optional().or(z.literal('').transform(() => undefined)),
+  // HMAC key for rewarded-ad custom data; derived from another configured server secret when unset.
+  REWARD_SIGNING_SECRET: z.string().optional(),
+  // AdMob rewarded ad unit whose server-side verification callbacks grant Pro time (ad unit ids are public).
+  ADMOB_REWARDED_UNIT: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -75,4 +87,4 @@ function parseEnv(): Env {
 export const env = parseEnv();
 
 
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';

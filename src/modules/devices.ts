@@ -9,6 +9,7 @@ import { COMMAND_SELECT, serializeCommand, serializeDevice } from './serializers
 import { createCommand, expireStaleCommands, resolveIssuer } from './commands.js';
 import { relay } from './relay.js';
 import { requireCapability } from '../lib/compat.js';
+import { assertDesktopAllowed } from './billing.js';
 
 export const devicesRouter = new Hono<AppEnv>();
 devicesRouter.use('*', requireUser);
@@ -72,6 +73,8 @@ devicesRouter.post('/register', async (c) => {
 
   const existing = await getDevice(id);
   if (existing?.revoked_at) throw forbidden('This device was revoked. Reset the device identity to register again.', 'DEVICE_REVOKED');
+  // Plan PC limit for new devices only (re-registering an existing PC is never blocked).
+  if (body.kind === 'desktop' && !existing) await assertDesktopAllowed(user.id);
 
   await db.run(
     `INSERT INTO devices (id, user_id, kind, name, platform, app_version, public_key, push_token, encryption_key, protocol, capabilities, last_seen_at, created_at)

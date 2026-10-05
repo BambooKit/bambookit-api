@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { gzipSync } from 'node:zlib';
-import { generateKeyPairSync, sign, createHash, randomUUID } from 'node:crypto';
+import { generateKeyPairSync, sign, createHash, createHmac, randomUUID, randomBytes } from 'node:crypto';
 import { SignJWT } from 'jose';
 
 process.env.NODE_ENV = 'test';
@@ -16,6 +16,9 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key';
 process.env.ADMIN_EMAILS = 'admin@example.com';
 process.env.TELEGRAM_BOT_TOKEN = 'test-bot-token';
 process.env.TELEGRAM_ADMIN_CHAT_IDS = '111';
+// Placeholder payment credentials; Cashfree is always mocked in tests.
+process.env.CASHFREE_APP_ID = 'test-app';
+process.env.CASHFREE_SECRET_KEY = 'test-secret';
 
 let app: typeof import('../src/app.js').app;
 let db: typeof import('../src/db/database.js').db;
@@ -23,6 +26,9 @@ let db: typeof import('../src/db/database.js').db;
 beforeAll(async () => {
   app = (await import('../src/app.js')).app;
   db = (await import('../src/db/database.js')).db;
+  // Treat every test account as created before the PC limit (the clock passes the real cutoff); the
+  // plan tests move individual accounts after it.
+  (await import('../src/modules/billing.js')).planPolicy.desktopLimitSince = '2100-01-01T00:00:00Z';
 });
 
 async function tokenFor(sub: string, email: string) {
@@ -975,5 +981,339 @@ describe('clearing recent activity', () => {
     // The other account keeps its activity.
     expect((await call('GET', '/v1/activity', { token: other })).json.data.length).toBeGreaterThan(0);
     expect((await call('GET', '/v1/notifications', { token: other })).json.data.length).toBeGreaterThan(0);
+  });
+});
+
+describe('plans, limits, payments and rewarded ads', () => {
+  const CUTOFF_PASSED = '2100-02-01T00:00:00.000Z';
+  const userId = async (token: string) => (await call('GET', '/v1/me', { token })).json.data.id as string;
+  const signWebhook = (raw: string, ts = String(Math.floor(Date.now() / 1000))) => ({ ts, sig: createHmac('sha256', 'test-secret').update(ts + raw).digest('base64') });
+  const postWebhook = (raw: string, headers: Record<string, string>) =>
+    app.request('http://localhost/v1/billing/cashfree/webhook', { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: raw });
+  const successEvent = (orderId: string, amount: number) =>
+    JSON.stringify({ type: 'PAYMENT_SUCCESS_WEBHOOK', event_time: new Date().toISOString(), data: { order: { order_id: orderId, order_amount: amount, order_currency: 'INR' }, payment: { cf_payment_id: String(Date.now()), payment_status: 'SUCCESS', payment_amount: amount } } });
+
+  /** Mocks Cashfree's API; returns the captured requests. */
+  function mockCashfree(orderStatus: Record<string, { order_status: string; order_amount: number }> = {}) {
+    const calls: { url: string; method: string; headers: Record<string, string>; body: any }[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: any, init: any = {}) => {
+      const u = String(url);
+      if (u.startsWith('https://sandbox.cashfree.com/') || u.startsWith('https://api.cashfree.com/')) {
+        calls.push({ url: u, method: init.method, headers: init.headers, body: init.body ? JSON.parse(init.body) : null });
+        if (init.method === 'POST') {
+          const b = JSON.parse(init.body);
+          return Response.json({ cf_order_id: 4242, order_id: b.order_id, order_status: 'ACTIVE', payment_session_id: `session_${b.order_id}` });
+        }
+        const id = decodeURIComponent(u.split('/').pop()!);
+        return Response.json({ order_id: id, cf_order_id: 4242, ...(orderStatus[id] ?? { order_status: 'ACTIVE', order_amount: 0 }) });
+      }
+      return realFetch(url, init);
+    }) as typeof fetch;
+    return { calls, restore: () => (globalThis.fetch = realFetch) };
+  }
+
+  async function capturePlanEvents(token: string) {
+    const bus = await import('../src/realtime/bus.js');
+    const events: any[] = [];
+    const off = bus.subscribe(await userId(token), (e) => {
+      if (e.type === 'plan.updated') events.push(e);
+    });
+    return { events, off };
+  }
+
+  it('publishes plans and limits, and starts every account on the free plan', async () => {
+    const plans = await call('GET', '/v1/billing/plans');
+    expect(plans.status).toBe(200);
+    expect(plans.json.data.products).toEqual([
+      { id: 'pro-month', name: expect.any(String), amount: 199, currency: 'INR', period: 'month', days: 30 },
+      { id: 'pro-year', name: expect.any(String), amount: 1999, currency: 'INR', period: 'year', days: 365 },
+    ]);
+    expect(plans.json.data.limits).toEqual({ free: { phoneMessagesPerDay: 20, phoneSessionsPerDay: 3, desktops: 1 }, pro: { phoneMessagesPerDay: null, phoneSessionsPerDay: null, desktops: 5 } });
+    expect(plans.json.data.payments).toEqual({ configured: true, environment: 'sandbox' });
+    expect(plans.json.data.rewards).toEqual({ hours: 24, maxPerDay: 2 });
+    expect(JSON.stringify(plans.json)).not.toContain('test-secret');
+
+    const token = await tokenFor('user-bill-free', 'free@example.com');
+    expect((await call('GET', '/v1/me/plan')).status).toBe(401);
+    const plan = await call('GET', '/v1/me/plan', { token });
+    expect(plan.status).toBe(200);
+    expect(plan.json.data).toMatchObject({
+      plan: 'free',
+      source: null,
+      proUntil: null,
+      ads: true,
+      limits: { phoneMessagesPerDay: 20, phoneSessionsPerDay: 3, desktops: 1 },
+      usage: { phoneMessagesToday: 0, phoneSessionsToday: 0, desktops: 0 },
+      rewards: { todayCount: 0, maxPerDay: 2, hours: 24 },
+    });
+    // resetsAt is the next midnight in the user's time zone.
+    expect(plan.json.data.resetsAt).toMatch(/T00:00:00\.000Z$/);
+    await call('PATCH', '/v1/me', { token, body: { timeZone: 'Asia/Kolkata' } });
+    expect((await call('GET', '/v1/me/plan', { token })).json.data.resetsAt).toMatch(/T18:30:00\.000Z$/);
+    expect((await call('GET', '/v1/me', { token })).json.data).toMatchObject({ plan: 'free', proUntil: null });
+  });
+
+  it('limits phone and web chats to 20 and new sessions to 3 a day on the free plan, never PC or approval actions', async () => {
+    const token = await tokenFor('user-bill-lim', 'lim@example.com');
+    const desktop = await setupDesktop(token);
+    const { mobileId } = await pairPhone(token, desktop);
+    await call('POST', '/v1/sync', {
+      token,
+      deviceId: desktop.id,
+      keys: desktop.keys,
+      body: { projects: [{ opencodeProjectId: 'p_lim', name: 'lim', directory: 'C:/lim' }], sessions: [{ opencodeSessionId: 'ses_lim', opencodeProjectId: 'p_lim', directory: 'C:/lim', title: 'L', status: 'idle', remote: true }] },
+    });
+    const session = (await call('GET', '/v1/sessions', { token })).json.data[0];
+    const send = (deviceId?: string) => call('POST', `/v1/sessions/${session.id}/commands`, { token, deviceId, body: { type: 'SEND_MESSAGE', payload: { text: 'hi' } } });
+
+    for (let i = 0; i < 15; i++) expect((await send(mobileId)).status).toBe(202);
+    for (let i = 0; i < 5; i++) expect((await send()).status).toBe(202); // website, same allowance
+    // Messages sent from the PC itself never count.
+    expect((await send(desktop.id)).status).toBe(202);
+    const blocked = await send(mobileId);
+    expect(blocked.status).toBe(402);
+    expect(blocked.json.error).toMatchObject({
+      code: 'PLAN_LIMIT',
+      message: 'Free plan limit reached for today.',
+      details: { limit: 'phoneMessagesPerDay', max: 20, used: 20, upgradeUrl: 'https://bambookit-web.onrender.com/pricing/' },
+    });
+    expect(blocked.json.error.details.resetsAt).toBe((await call('GET', '/v1/me/plan', { token })).json.data.resetsAt);
+    expect((await send()).status).toBe(402);
+    expect((await send(desktop.id)).status).toBe(202);
+    // Everything else keeps working.
+    for (const [type, payload] of [['ABORT', {}], ['RENAME_SESSION', { title: 'New' }], ['CONTINUE_ON_PC', {}], ['READ_FILE', { path: 'a.ts' }]] as const) {
+      expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token, deviceId: mobileId, body: { type, payload } })).status).toBe(202);
+    }
+    expect((await call('PATCH', `/v1/sessions/${session.id}`, { token, body: { starred: true } })).status).toBe(200);
+
+    const project = (await call('GET', '/v1/projects', { token })).json.data[0];
+    const start = () => call('POST', `/v1/projects/${project.id}/sessions`, { token, deviceId: mobileId, body: { text: 'new' } });
+    for (let i = 0; i < 3; i++) expect((await start()).status).toBe(202);
+    const noMore = await start();
+    expect(noMore.status).toBe(402);
+    expect(noMore.json.error.details).toMatchObject({ limit: 'phoneSessionsPerDay', max: 3, used: 3 });
+
+    const plan = (await call('GET', '/v1/me/plan', { token })).json.data;
+    expect(plan.usage).toEqual({ phoneMessagesToday: 20, phoneSessionsToday: 3, desktops: 1 });
+  });
+
+  it('answers 503 for checkout until Cashfree is configured', async () => {
+    const { env } = await import('../src/config/env.js');
+    const token = await tokenFor('user-bill-503', 'nopay@example.com');
+    const saved = env.CASHFREE_APP_ID;
+    env.CASHFREE_APP_ID = undefined;
+    try {
+      const res = await call('POST', '/v1/billing/checkout', { token, body: { productId: 'pro-month' } });
+      expect(res.status).toBe(503);
+      expect(res.json.error.code).toBe('PAYMENTS_NOT_CONFIGURED');
+      expect((await call('GET', '/v1/billing/plans')).json.data.payments.configured).toBe(false);
+    } finally {
+      env.CASHFREE_APP_ID = saved;
+    }
+    expect((await call('POST', '/v1/billing/checkout', { token, body: { productId: 'pro-forever' } })).status).toBe(400);
+  });
+
+  it('creates Cashfree orders and grants Pro once per verified payment', async () => {
+    const token = await tokenFor('user-bill-pay', 'payer.person@gmail.com');
+    const uid = await userId(token);
+    const plans = await capturePlanEvents(token);
+    const billing = await import('../src/modules/billing.js');
+    const alerts: any[] = [];
+    billing.setPaymentListener((p) => alerts.push(p));
+    const cf = mockCashfree();
+    try {
+      const checkout = await call('POST', '/v1/billing/checkout', { token, body: { productId: 'pro-month' } });
+      expect(checkout.status).toBe(200);
+      const orderId = checkout.json.data.orderId as string;
+      expect(checkout.json.data).toEqual({ orderId, paymentSessionId: `session_${orderId}`, environment: 'sandbox', amount: 199, currency: 'INR', productId: 'pro-month' });
+      const req = cf.calls[0];
+      expect(req.url).toBe('https://sandbox.cashfree.com/pg/orders');
+      expect(req.headers).toMatchObject({ 'x-client-id': 'test-app', 'x-client-secret': 'test-secret', 'x-api-version': '2023-08-01' });
+      expect(req.body).toMatchObject({
+        order_id: orderId,
+        order_amount: 199,
+        order_currency: 'INR',
+        customer_details: { customer_id: uid.replace(/[^A-Za-z0-9]/g, ''), customer_email: 'payer.person@gmail.com', customer_phone: '9999999999' },
+      });
+      expect(req.body.order_meta.return_url).toBe('https://bambookit-web.onrender.com/billing/return/?order_id={order_id}');
+      expect((await call('GET', `/v1/billing/orders/${orderId}`, { token })).json.data).toMatchObject({ id: orderId, status: 'PENDING', productId: 'pro-month', amount: 199, currency: 'INR', paidAt: null });
+      // Orders are private.
+      const other = await tokenFor('user-bill-other', 'other@example.com');
+      expect((await call('GET', `/v1/billing/orders/${orderId}`, { token: other })).status).toBe(404);
+
+      // Bad or missing signatures, or a changed body, are rejected.
+      const raw = successEvent(orderId, 199);
+      const { ts, sig } = signWebhook(raw);
+      expect((await postWebhook(raw, { 'x-webhook-timestamp': ts, 'x-webhook-signature': 'bad' })).status).toBe(401);
+      expect((await postWebhook(raw, {})).status).toBe(401);
+      expect((await postWebhook(raw.replace('199', '1'), { 'x-webhook-timestamp': ts, 'x-webhook-signature': sig })).status).toBe(401);
+      expect((await call('GET', '/v1/me/plan', { token })).json.data.plan).toBe('free');
+
+      const before = Date.now();
+      const ok = await postWebhook(raw, { 'x-webhook-timestamp': ts, 'x-webhook-signature': sig });
+      expect(ok.status).toBe(200);
+      expect(((await ok.json()) as any).granted).toBe(true);
+      const plan = (await call('GET', '/v1/me/plan', { token })).json.data;
+      expect(plan).toMatchObject({ plan: 'pro', source: 'payment', ads: false, limits: { phoneMessagesPerDay: null, desktops: 5 } });
+      const until = Date.parse(plan.proUntil);
+      expect(until - before).toBeGreaterThanOrEqual(30 * 86_400_000 - 5000);
+      expect(until - before).toBeLessThanOrEqual(30 * 86_400_000 + 5000);
+      expect((await call('GET', '/v1/me', { token })).json.data).toMatchObject({ plan: 'pro', proUntil: plan.proUntil });
+
+      // Cashfree retries webhooks: a duplicate never grants twice.
+      const again = await postWebhook(raw, { 'x-webhook-timestamp': ts, 'x-webhook-signature': sig });
+      expect(((await again.json()) as any).granted).toBe(false);
+      expect((await call('GET', '/v1/me/plan', { token })).json.data.proUntil).toBe(plan.proUntil);
+      expect(plans.events).toHaveLength(1);
+      expect(plans.events[0].payload).toMatchObject({ plan: 'pro', source: 'payment' });
+      expect(alerts).toEqual([expect.objectContaining({ amount: 199, productId: 'pro-month' })]);
+      const { paymentAlertText } = await import('../src/services/telegram.js');
+      const text = paymentAlertText(alerts[0]);
+      expect(text).toContain('199.00');
+      expect(text).toContain('p***@gmail.com');
+      expect(text).not.toContain('payer.person');
+
+      // A paid amount that does not match the order is not granted.
+      const second = await call('POST', '/v1/billing/checkout', { token, body: { productId: 'pro-month' } });
+      const wrong = successEvent(second.json.data.orderId, 1);
+      const s2 = signWebhook(wrong);
+      expect(((await (await postWebhook(wrong, { 'x-webhook-timestamp': s2.ts, 'x-webhook-signature': s2.sig })).json()) as any).granted).toBe(false);
+      expect((await call('GET', `/v1/billing/orders/${second.json.data.orderId}`, { token })).json.data.status).toBe('PENDING');
+      expect((await call('GET', '/v1/me/plan', { token })).json.data.proUntil).toBe(plan.proUntil);
+
+      const history = await call('GET', '/v1/billing/history', { token });
+      expect(history.json.data.map((o: any) => o.id)).toEqual([second.json.data.orderId, orderId]);
+      expect(history.json.data[1]).toMatchObject({ status: 'PAID', paidAt: expect.any(String) });
+      expect(JSON.stringify(history.json)).not.toContain('session_');
+
+      const admin = await tokenFor('user-bill-adm-view', 'admin@example.com');
+      const snap = (await call('GET', '/v1/admin/overview', { token: admin })).json.data.billing;
+      expect(snap).toMatchObject({ configured: true, environment: 'sandbox' });
+      expect(snap.paidOrders30d).toBeGreaterThanOrEqual(1);
+      expect(snap.revenue30d).toBeGreaterThanOrEqual(199);
+      expect(snap.activePro).toBeGreaterThanOrEqual(1);
+    } finally {
+      cf.restore();
+      plans.off();
+      billing.setPaymentListener(null);
+    }
+  });
+
+  it('confirms a pending order with Cashfree when the app polls it, and extends existing Pro time', async () => {
+    const token = await tokenFor('user-bill-poll', 'poll@example.com');
+    const status: Record<string, { order_status: string; order_amount: number }> = {};
+    const cf = mockCashfree(status);
+    try {
+      const checkout = await call('POST', '/v1/billing/checkout', { token, body: { productId: 'pro-year' } });
+      const orderId = checkout.json.data.orderId;
+      expect((await call('GET', `/v1/billing/orders/${orderId}`, { token })).json.data.status).toBe('PENDING');
+      expect(cf.calls.at(-1)!.url).toBe(`https://sandbox.cashfree.com/pg/orders/${orderId}`);
+
+      await db.run('UPDATE users SET pro_until = ?, pro_source = ? WHERE id = ?', new Date(Date.now() + 86_400_000).toISOString(), 'reward', await userId(token));
+      status[orderId] = { order_status: 'PAID', order_amount: 1999 };
+      const paid = await call('GET', `/v1/billing/orders/${orderId}`, { token });
+      expect(paid.json.data).toMatchObject({ status: 'PAID', productId: 'pro-year', amount: 1999 });
+      const plan = (await call('GET', '/v1/me/plan', { token })).json.data;
+      expect(plan.source).toBe('payment');
+      expect(Date.parse(plan.proUntil) - Date.now()).toBeGreaterThan(365 * 86_400_000);
+      expect(Date.parse(plan.proUntil) - Date.now()).toBeLessThan(366 * 86_400_000 + 5000);
+      // The webhook arriving afterwards changes nothing.
+      const raw = successEvent(orderId, 1999);
+      const { ts, sig } = signWebhook(raw);
+      expect(((await (await postWebhook(raw, { 'x-webhook-timestamp': ts, 'x-webhook-signature': sig })).json()) as any).granted).toBe(false);
+      expect((await call('GET', '/v1/me/plan', { token })).json.data.proUntil).toBe(plan.proUntil);
+    } finally {
+      cf.restore();
+    }
+  });
+
+  it('grants 24 hours of Pro per verified rewarded ad, at most twice a day', async () => {
+    const { setVerifierKeyLoader } = await import('../src/services/admob.js');
+    const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    setVerifierKeyLoader(async () => [{ keyId: 3335741209, base64: publicKey.export({ type: 'spki', format: 'der' }).toString('base64') }]);
+    const token = await tokenFor('user-bill-ad', 'ads@example.com');
+    const plans = await capturePlanEvents(token);
+    try {
+      expect((await call('POST', '/v1/rewards/token')).status).toBe(401);
+      const issued = await call('POST', '/v1/rewards/token', { token });
+      expect(issued.status).toBe(200);
+      expect(issued.json.data.userId).toBe(await userId(token));
+      const customData = issued.json.data.customData as string;
+
+      const callback = (opts: { tx?: string; unit?: string; data?: string; key?: typeof privateKey; tamper?: boolean } = {}) => {
+        const content = `ad_network=5450213213286189855&ad_unit=${opts.unit ?? '8440048550'}&custom_data=${encodeURIComponent(opts.data ?? customData)}&reward_amount=1&reward_item=Pro&timestamp=${Date.now()}&transaction_id=${opts.tx ?? randomBytes(16).toString('hex')}&user_id=${issued.json.data.userId}`;
+        const signature = sign('sha256', Buffer.from(content), opts.key ?? privateKey).toString('base64url');
+        const query = `${opts.tamper ? content.replace('reward_amount=1', 'reward_amount=9') : content}&signature=${signature}&key_id=3335741209`;
+        return app.request(`http://localhost/v1/rewards/admob-ssv?${query}`).then(async (r) => ({ status: r.status, json: (await r.json()) as any }));
+      };
+
+      expect((await callback({ tamper: true })).status).toBe(400);
+      expect((await callback({ key: generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey })).status).toBe(400);
+      expect((await app.request('http://localhost/v1/rewards/admob-ssv?ad_unit=8440048550')).status).toBe(400);
+      // Valid signature but not our ad unit or not our token: acknowledged, nothing granted.
+      expect((await callback({ unit: '1234567890' })).json.data).toEqual({ granted: false, reason: 'AD_UNIT' });
+      expect((await callback({ data: `${customData.split('.')[0]}.AAAAAAAAAAAAAAAAAAAAAA` })).json.data).toEqual({ granted: false, reason: 'CUSTOM_DATA' });
+      expect((await call('GET', '/v1/me/plan', { token })).json.data.plan).toBe('free');
+
+      const tx = randomBytes(16).toString('hex');
+      const before = Date.now();
+      const first = await callback({ tx });
+      expect(first).toEqual({ status: 200, json: { data: { granted: true } } });
+      let plan = (await call('GET', '/v1/me/plan', { token })).json.data;
+      expect(plan).toMatchObject({ plan: 'pro', source: 'reward', ads: false, rewards: { todayCount: 1, maxPerDay: 2, hours: 24 } });
+      expect(Date.parse(plan.proUntil) - before).toBeGreaterThanOrEqual(24 * 3600_000 - 5000);
+      // Google may deliver the same callback again.
+      expect((await callback({ tx })).json.data).toEqual({ granted: false, reason: 'DUPLICATE' });
+      expect((await callback()).json.data).toEqual({ granted: true });
+      expect((await callback()).json.data).toEqual({ granted: false, reason: 'DAILY_LIMIT' });
+      plan = (await call('GET', '/v1/me/plan', { token })).json.data;
+      expect(plan.rewards.todayCount).toBe(2);
+      expect(Date.parse(plan.proUntil) - before).toBeGreaterThanOrEqual(48 * 3600_000 - 5000);
+      expect(Date.parse(plan.proUntil) - before).toBeLessThan(48 * 3600_000 + 5000);
+      expect(plans.events).toHaveLength(2);
+      expect(plans.events[1].payload.rewards.todayCount).toBe(2);
+    } finally {
+      plans.off();
+      setVerifierKeyLoader(null);
+    }
+  });
+
+  it('allows one PC on the free plan for new accounts, keeps existing accounts grandfathered, and exempts admins', async () => {
+    const registerPc = async (token: string, keys = desktopKeys()) => ({
+      keys,
+      res: await call('POST', '/v1/devices/register', { token, keys, body: { kind: 'desktop', name: 'PC', platform: 'windows', publicKey: keys.publicPem } }),
+    });
+
+    const fresh = await tokenFor('user-bill-new', 'newbie@example.com');
+    await db.run('UPDATE users SET created_at = ? WHERE id = ?', CUTOFF_PASSED, await userId(fresh));
+    const first = await registerPc(fresh);
+    expect(first.res.status).toBe(201);
+    const second = await registerPc(fresh);
+    expect(second.res.status).toBe(402);
+    expect(second.res.json.error).toMatchObject({ code: 'PLAN_LIMIT', details: { limit: 'desktops', max: 1, used: 1, upgradeUrl: 'https://bambookit-web.onrender.com/pricing/' } });
+    // The same PC can always register again (updates, restarts).
+    expect((await registerPc(fresh, first.keys)).res.status).toBe(200);
+    // Pro allows more PCs.
+    await db.run('UPDATE users SET pro_until = ?, pro_source = ? WHERE id = ?', new Date(Date.now() + 86_400_000).toISOString(), 'payment', await userId(fresh));
+    expect((await registerPc(fresh)).res.status).toBe(201);
+
+    const old = await tokenFor('user-bill-old', 'oldtimer@example.com');
+    await userId(old);
+    expect((await registerPc(old)).res.status).toBe(201);
+    expect((await registerPc(old)).res.status).toBe(201);
+
+    const admin = await tokenFor('user-bill-admin', 'admin@example.com');
+    await db.run('UPDATE users SET created_at = ? WHERE id = ?', CUTOFF_PASSED, await userId(admin));
+    const plan = (await call('GET', '/v1/me/plan', { token: admin })).json.data;
+    expect(plan).toMatchObject({ plan: 'pro', source: 'admin', ads: false, limits: { phoneMessagesPerDay: null, phoneSessionsPerDay: null } });
+    const pcs = [await registerPc(admin), await registerPc(admin)];
+    expect(pcs.map((p) => p.res.status)).toEqual([201, 201]);
+    const desktop = { keys: pcs[0].keys, id: pcs[0].res.json.data.id as string };
+    await call('POST', '/v1/sync', { token: admin, deviceId: desktop.id, keys: desktop.keys, body: { sessions: [{ opencodeSessionId: 'ses_adm', directory: 'C:/a', title: 'A', status: 'idle', remote: true }] } });
+    const session = (await call('GET', `/v1/sessions?deviceId=${desktop.id}`, { token: admin })).json.data[0];
+    for (let i = 0; i < 25; i++) {
+      expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token: admin, body: { type: 'SEND_MESSAGE', payload: { text: 'x' } } })).status).toBe(202);
+    }
   });
 });

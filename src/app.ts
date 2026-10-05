@@ -24,6 +24,7 @@ import { adminRouter } from './modules/admin.js';
 import { telegramRouter } from './services/telegram.js';
 import { profileRouter } from './modules/profile.js';
 import { historyRouter } from './modules/history.js';
+import { billingRouter } from './modules/billing.js';
 
 export const app = new Hono<AppEnv>();
 
@@ -57,6 +58,8 @@ app.get('/ready', async (c) => {
 
 const v1 = new Hono<AppEnv>();
 v1.route('/', metaRouter); // /meta, /releases/latest — public, so mounted before routers that require sign-in
+// /billing/*, /me/plan, /rewards/* — plans, webhooks and ad callbacks are public, so also before profileRouter
+v1.route('/', billingRouter);
 v1.route('/', profileRouter); // /me, /me/avatar*, DELETE /me
 v1.route('/', accountRouter); // /overview, /activity
 v1.route('/', statsRouter); // /me/stats, /me/achievements, PATCH /projects/:id

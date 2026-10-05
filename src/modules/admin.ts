@@ -7,6 +7,7 @@ import { HttpError } from '../lib/http.js';
 import { health } from '../lib/monitor.js';
 import { connectionTotals } from '../realtime/bus.js';
 import { storage } from '../services/storage.js';
+import { billingSnapshot } from './billing.js';
 
 /**
  * Admin panel data. Only accounts whose email is listed in ADMIN_EMAILS (and verified when the sign-in
@@ -60,6 +61,7 @@ export async function adminSnapshot() {
       tasks7d: await n('SELECT COUNT(*) AS n FROM work_intervals WHERE started_at >= ?', since(7 * DAY)),
       failed7d: await n("SELECT COUNT(*) AS n FROM work_intervals WHERE started_at >= ? AND outcome = 'failed'", since(7 * DAY)),
     },
+    billing: await billingSnapshot(),
   };
 }
 

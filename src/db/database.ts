@@ -387,6 +387,39 @@ async function migrate(d: Database) {
   await d.run("ALTER TABLE approvals ADD COLUMN kind TEXT NOT NULL DEFAULT 'permission'").catch(() => undefined);
   await d.run('ALTER TABLE approvals ADD COLUMN questions TEXT').catch(() => undefined);
   await d.run('ALTER TABLE approvals ADD COLUMN answers TEXT').catch(() => undefined);
+  // Plans and payments (see modules/billing.ts): Pro time on the user, Cashfree orders, rewarded-ad grants
+  // (idempotent per AdMob transaction) and per-day phone/web usage counters in the user's time zone.
+  await d.run('ALTER TABLE users ADD COLUMN pro_until TEXT').catch(() => undefined);
+  await d.run('ALTER TABLE users ADD COLUMN pro_source TEXT').catch(() => undefined);
+  await d.run(`CREATE TABLE IF NOT EXISTS billing_orders (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    amount_paise INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('PENDING','PAID','FAILED','EXPIRED')),
+    cf_order_id TEXT,
+    payment_id TEXT,
+    created_at TEXT NOT NULL,
+    paid_at TEXT
+  )`);
+  await d.run('CREATE INDEX IF NOT EXISTS billing_orders_user ON billing_orders(user_id, created_at)');
+  await d.run(`CREATE TABLE IF NOT EXISTS reward_grants (
+    transaction_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    granted INTEGER NOT NULL DEFAULT 0,
+    ad_network TEXT,
+    created_at TEXT NOT NULL
+  )`);
+  await d.run('CREATE INDEX IF NOT EXISTS reward_grants_user ON reward_grants(user_id, day)');
+  await d.run(`CREATE TABLE IF NOT EXISTS plan_usage (
+    user_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day, metric)
+  )`);
   // Session chats, diffs and activity now live only on the PC; remove copies stored by earlier versions.
   await d.run('DELETE FROM session_parts');
   await d.run('DELETE FROM session_diffs');

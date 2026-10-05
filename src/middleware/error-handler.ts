@@ -24,8 +24,8 @@ export const errorHandler: ErrorHandler = (err, c) => {
   if (err instanceof HttpError) {
     if (err.status >= 500) {
       logger.error(err.message, { requestId, code: err.code });
-      // Relay outcomes (PC offline/timeout) are expected, not server faults.
-      if (!['DESKTOP_OFFLINE', 'DESKTOP_TIMEOUT'].includes(err.code)) remember(c, err.status, err.code, err.message, requestId);
+      // Relay outcomes (PC offline/timeout) and unconfigured payments are expected, not server faults.
+      if (!['DESKTOP_OFFLINE', 'DESKTOP_TIMEOUT', 'PAYMENTS_NOT_CONFIGURED'].includes(err.code)) remember(c, err.status, err.code, err.message, requestId);
     }
     return c.json({ error: { code: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) }, requestId }, err.status);
   }
