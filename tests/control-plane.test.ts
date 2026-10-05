@@ -820,17 +820,21 @@ describe('profile statistics, achievements and compatibility', () => {
     expect(s.codingTime.totalMs).toBeGreaterThanOrEqual(89 * 60_000);
     expect(s.codingTime.totalMs).toBeLessThanOrEqual(91 * 60_000);
     const byId = Object.fromEntries(s.achievements.map((a: any) => [a.id, a]));
-    expect(byId['first-project'].unlocked).toBe(true);
-    expect(byId['first-session'].unlocked).toBe(true);
-    expect(byId['first-change'].unlocked).toBe(true);
-    expect(byId['long-session'].unlocked).toBe(true);
-    expect(byId['project-manager']).toMatchObject({ unlocked: false, progress: 1, target: 5 });
+    expect(byId['projects-managed']).toMatchObject({ unlocked: true, tier: 'bronze', nextTier: 'silver', progress: 1, target: 5 });
+    expect(byId['projects-built'].tier).toBe('bronze');
+    expect(byId['code-written']).toMatchObject({ tier: 'bronze', value: 120, target: 1000 });
+    expect(byId['files-changed']).toMatchObject({ tier: 'bronze', value: 6 });
+    expect(byId['long-sessions']).toMatchObject({ tier: 'bronze', unit: 'hours' });
+    expect(byId['code-changes']).toMatchObject({ unlocked: false, tier: null, progress: 7, target: 10 });
+    expect(s.achievementSummary.total).toBe(50);
 
     // Unlocked once: a second refresh adds no rows or notifications.
+    const rows = (await db.get('SELECT COUNT(*) AS n FROM user_achievements WHERE user_id = ?', me.id)).n;
+    const notesBefore = (await call('GET', '/v1/notifications', { token })).json.data.filter((n: any) => n.type === 'achievement.unlocked').length;
     await call('GET', '/v1/me/achievements', { token });
-    expect((await db.get('SELECT COUNT(*) AS n FROM user_achievements WHERE user_id = ?', me.id)).n).toBe(4);
+    expect((await db.get('SELECT COUNT(*) AS n FROM user_achievements WHERE user_id = ?', me.id)).n).toBe(rows);
     const notes = (await call('GET', '/v1/notifications', { token })).json.data.filter((n: any) => n.type === 'achievement.unlocked');
-    expect(notes).toHaveLength(4);
+    expect(notes).toHaveLength(notesBefore);
 
     // A failed task counts as failed, and the project status is the user's.
     await sync('busy');
@@ -868,6 +872,195 @@ describe('profile statistics, achievements and compatibility', () => {
     expect(meta.status).toBe(200);
     expect(meta.json.data.protocol).toBeGreaterThanOrEqual(2);
     expect(meta.json.data.desktopRequirements.providerKeys.since).toBe('1.0.3');
+  });
+});
+
+describe('tiered achievements', () => {
+  const fullStats = {
+    filesCreated: 12, filesModified: 40, filesDeleted: 3, filesRenamed: 0, linesAdded: 1500, linesDeleted: 250, edits: 120,
+    testsRun: 12, testsPassed: 11, testsFailed: 1, commits: 9, deployments: 1, debugging: true,
+    prompts: 1, bugPrompts: 12, toolCalls: 300, terminalCommands: 30, subagentTasks: 6, mcpToolCalls: 4,
+    mcpTools: ['github_create_issue', 'github_list_prs', 'linear_search'], agents: ['build', 'explore', 'general'],
+    packagesInstalled: 5, branches: 5, merges: 1, pullRequests: 1, cloudDeployments: 1, cleanups: 6, docFiles: 2,
+    refactoring: false, review: true, experiment: false, retries: 0, firstTryPass: false, activeSeconds: 300,
+  };
+  async function syncSession(token: string, desktop: { keys: Keys; id: string }, sessionId: string, stats: unknown) {
+    return call('POST', '/v1/sync', {
+      token, deviceId: desktop.id, keys: desktop.keys,
+      body: {
+        projects: [{ opencodeProjectId: 'p_tier', name: 'Tiers', directory: 'C:/tiers' }],
+        sessions: [{ opencodeSessionId: sessionId, opencodeProjectId: 'p_tier', directory: 'C:/tiers', title: 'Fix it', status: 'idle', ...(stats ? { stats } : {}) }],
+      },
+    });
+  }
+  const notesOf = async (token: string) => (await call('GET', '/v1/notifications', { token })).json.data.filter((n: any) => n.type === 'achievement.unlocked');
+
+  it('returns 50 tiered achievements with backward-compatible fields, unlocks tiers once, and summarises bulk unlocks', async () => {
+    const token = await tokenFor('user-tier-1', 'tier1@example.com');
+    const desktop = await setupDesktop(token);
+    const me = (await call('GET', '/v1/me', { token })).json.data;
+    expect((await syncSession(token, desktop, 'ses_t1', fullStats)).status).toBe(200);
+    await db.run("UPDATE sessions SET tasks_completed = 1, active_ms = 300000 WHERE opencode_session_id = 'ses_t1'");
+
+    const res = await call('GET', '/v1/me/achievements', { token });
+    expect(res.status).toBe(200);
+    const list = res.json.data;
+    expect(list).toHaveLength(50);
+    expect(new Set(list.map((a: any) => a.id)).size).toBe(50);
+    for (const a of list) {
+      expect(Object.keys(a)).toEqual(expect.arrayContaining(['id', 'emoji', 'title', 'description', 'unit', 'trackable', 'value', 'tiers', 'tier', 'nextTier', 'progress', 'target', 'unlocked', 'unlockedAt']));
+      expect(a.tiers.map((t: any) => t.name)).toEqual(['bronze', 'silver', 'gold', 'platinum', 'diamond']);
+    }
+    const byId = Object.fromEntries(list.map((a: any) => [a.id, a]));
+    // Tier thresholds: 1,500 lines is Silver (1K) on the way to Gold (10K).
+    expect(byId['code-written']).toMatchObject({ value: 1500, tier: 'silver', nextTier: 'gold', progress: 1500, target: 10_000, unlocked: true });
+    expect(byId['code-written'].tiers.map((t: any) => t.unlocked)).toEqual([true, true, false, false, false]);
+    expect(byId['code-written'].unlockedAt).toBe(byId['code-written'].tiers[1].unlockedAt);
+    expect(byId['code-changes']).toMatchObject({ value: 120, tier: 'silver' });
+    expect(byId['commits']).toMatchObject({ value: 9, tier: null, unlocked: false, unlockedAt: null, target: 10 });
+    expect(byId['tool-calls']).toMatchObject({ value: 300, tier: 'silver' });
+    expect(byId['integrations']).toMatchObject({ value: 2, tier: 'bronze' });
+    expect(byId['mcp-tools']).toMatchObject({ value: 3, tier: 'bronze' });
+    expect(byId['multi-agent']).toMatchObject({ value: 3, tier: 'bronze' });
+    expect(byId['bugs-fixed'].value).toBe(1);
+    expect(byId['fast-fix']).toMatchObject({ value: 1, tier: 'bronze' });
+    expect(byId['one-shot-fix']).toMatchObject({ value: 1, tier: 'bronze' });
+    expect(byId['production-fixes']).toMatchObject({ value: 1, tier: 'bronze' });
+    expect(byId['code-reviews'].value).toBe(1);
+    expect(byId['tasks-without-retry'].value).toBe(1);
+    expect(byId['successful-sessions'].value).toBe(1);
+    expect(byId['devices-connected']).toMatchObject({ value: 1, tier: 'bronze' });
+    expect(byId['documentation']).toMatchObject({ value: 2, tier: 'bronze' });
+    // Untrackable items never show progress.
+    for (const id of ['open-source', 'github-stars', 'contributions']) {
+      expect(byId[id]).toMatchObject({ trackable: false, reason: 'Needs a GitHub connection — coming later', value: 0, tier: null, unlocked: false });
+    }
+    expect(byId['code-written'].reason).toBeUndefined();
+    // BambooKit Master counts the others with at least Bronze (and itself once it has Bronze).
+    const others = list.filter((a: any) => a.id !== 'bambookit-master' && a.tier).length;
+    expect(others).toBeGreaterThanOrEqual(10);
+    expect(byId['bambookit-master']).toMatchObject({ value: others + 1, tier: others + 1 >= 25 ? 'silver' : 'bronze', target: others + 1 >= 25 ? 35 : 25 });
+    const summary = res.json.summary;
+    const tiers = list.reduce((n: number, a: any) => n + a.tiers.filter((t: any) => t.unlocked).length, 0);
+    const points = list.reduce((n: number, a: any) => n + a.tiers.reduce((m: number, t: any, i: number) => m + (t.unlocked ? i + 1 : 0), 0), 0);
+    expect(summary).toMatchObject({ unlocked: others + 1, total: 50, tiersUnlocked: tiers, tiersTotal: 250, points, currentStreak: 1, longestStreak: 1 });
+
+    // Stored per tier; one summary notification instead of one per tier.
+    const rows = await db.all<{ achievement: string }>('SELECT achievement FROM user_achievements WHERE user_id = ?', me.id);
+    expect(rows.length).toBe(tiers);
+    expect(rows.map((r) => r.achievement)).toContain('code-written:silver');
+    const notes = await notesOf(token);
+    expect(notes.some((n: any) => /^You unlocked \d+ achievement tiers$/.test(n.body))).toBe(true);
+    expect(notes.length).toBeLessThanOrEqual(4);
+
+    // Idempotent: refreshing again stores and notifies nothing.
+    await call('GET', '/v1/me/achievements', { token });
+    await call('GET', '/v1/me/stats', { token });
+    expect((await db.get('SELECT COUNT(*) AS n FROM user_achievements WHERE user_id = ?', me.id)).n).toBe(tiers);
+    expect(await notesOf(token)).toHaveLength(notes.length);
+
+    // One new tier: its own notification.
+    await syncSession(token, desktop, 'ses_t1', { ...fullStats, commits: 10 });
+    const after = (await call('GET', '/v1/me/achievements', { token })).json.data.find((a: any) => a.id === 'commits');
+    expect(after).toMatchObject({ tier: 'bronze', value: 10, target: 100 });
+    const latest = await notesOf(token);
+    expect(latest).toHaveLength(notes.length + 1);
+    expect(latest.some((n: any) => n.body === '🔀 Commits — Bronze')).toBe(true);
+
+    // Unlocked tiers stay unlocked even if the session is removed on the PC.
+    await call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { removedSessions: ['ses_t1'] } });
+    const kept = (await call('GET', '/v1/me/achievements', { token })).json.data.find((a: any) => a.id === 'code-written');
+    expect(kept).toMatchObject({ value: 0, tier: 'silver', unlocked: true });
+  });
+
+  it('computes streaks and nights in the user time zone', async () => {
+    const token = await tokenFor('user-tier-2', 'tier2@example.com');
+    await setupDesktop(token);
+    const me = (await call('GET', '/v1/me', { token })).json.data;
+    const add = (start: string, minutes: number) =>
+      db.run(
+        'INSERT INTO work_intervals (id, user_id, project_id, session_id, started_at, ended_at, duration_ms, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        `wrk_${randomUUID()}`, me.id, null, 'ses_none', start, new Date(Date.parse(start) + minutes * 60_000).toISOString(), minutes * 60_000, 'completed',
+      );
+    // 20:00 UTC is 01:30 the next day in India and 12:00 the same day in Los Angeles.
+    await add('2026-01-01T20:00:00.000Z', 10);
+    await add('2026-01-02T10:00:00.000Z', 3);
+    await add('2026-01-05T10:00:00.000Z', 3);
+    await add('2026-01-06T10:00:00.000Z', 3);
+    await add('2026-01-07T10:00:00.000Z', 3);
+    await add('2026-01-08T10:00:00.000Z', 3);
+    const get = async () => {
+      const r = (await call('GET', '/v1/me/achievements', { token })).json;
+      const byId = Object.fromEntries(r.data.map((a: any) => [a.id, a]));
+      return { summary: r.summary, streak: byId['coding-streak'].value, nights: byId['night-coder'].value, speed: byId['speed-builder'].value };
+    };
+    expect((await call('PATCH', '/v1/me', { token, body: { timeZone: 'UTC' } })).status).toBe(200);
+    let r = await get();
+    // UTC: Jan 1, 2 (two days) and Jan 5–8 (four days); no work between 22:00 and 05:00.
+    expect(r).toMatchObject({ streak: 4, nights: 0, speed: 5 });
+    expect(r.summary).toMatchObject({ longestStreak: 4, currentStreak: 0 });
+    expect((await call('PATCH', '/v1/me', { token, body: { timeZone: 'Asia/Kolkata' } })).status).toBe(200);
+    // India: 01:30 on Jan 2 is the night of Jan 1.
+    r = await get();
+    expect(r).toMatchObject({ streak: 4, nights: 1 });
+    expect((await call('PATCH', '/v1/me', { token, body: { timeZone: 'Pacific/Kiritimati' } })).status).toBe(200);
+    // UTC+14: Jan 2 10:00, Jan 3 00:00 and Jan 6–9 00:00 (five nights) → still a four-day streak.
+    r = await get();
+    expect(r).toMatchObject({ streak: 4, nights: 5 });
+
+    const { streaks, masterValue, mcpServer } = await import('../src/modules/stats.js');
+    expect(streaks([1, 2, 3, 7, 8], 9)).toEqual({ longest: 3, current: 2 });
+    expect(streaks([1, 2, 3, 7, 8], 8)).toEqual({ longest: 3, current: 2 });
+    expect(streaks([5, 1, 2, 3, 2], 10)).toEqual({ longest: 3, current: 0 });
+    expect(streaks([], 10)).toEqual({ longest: 0, current: 0 });
+    expect(masterValue(9)).toBe(9);
+    expect(masterValue(10)).toBe(11);
+    expect(masterValue(47)).toBe(48);
+    expect(mcpServer('github_create_issue')).toBe('github');
+    expect(mcpServer('fetch')).toBe('fetch');
+  });
+
+  it('keeps syncing desktops that send only the original statistics, without counting unreported fields', async () => {
+    const token = await tokenFor('user-tier-3', 'tier3@example.com');
+    const desktop = await setupDesktop(token);
+    const old = { filesCreated: 2, filesModified: 3, filesDeleted: 0, filesRenamed: 0, linesAdded: 150, linesDeleted: 5, edits: 12, testsRun: 0, testsPassed: 0, testsFailed: 0, commits: 0, deployments: 0, debugging: true };
+    const res = await syncSession(token, desktop, 'ses_old', old);
+    expect(res.status).toBe(200);
+    expect(res.json.data.rejected).toBeUndefined();
+    const stored = JSON.parse((await db.get("SELECT stats FROM sessions WHERE opencode_session_id = 'ses_old'")).stats);
+    expect(stored.prompts).toBeUndefined();
+    expect(stored.retries).toBeUndefined();
+    await db.run("UPDATE sessions SET tasks_completed = 1 WHERE opencode_session_id = 'ses_old'");
+    const byId = Object.fromEntries((await call('GET', '/v1/me/achievements', { token })).json.data.map((a: any) => [a.id, a]));
+    expect(byId['code-written']).toMatchObject({ value: 150, tier: 'bronze' });
+    expect(byId['code-changes']).toMatchObject({ value: 12, tier: 'bronze' });
+    expect(byId['bugs-fixed'].value).toBe(1);
+    // Retries and prompt counts were never reported, so they prove nothing.
+    expect(byId['tasks-without-retry'].value).toBe(0);
+    expect(byId['one-shot-fix'].value).toBe(0);
+    expect(byId['prompts-sent'].value).toBe(0);
+
+    // Invalid new fields lose only the statistics, never the session.
+    const bad = await syncSession(token, desktop, 'ses_bad', { ...old, mcpTools: Array.from({ length: 300 }, (_, i) => `t${i}`) });
+    expect(bad.status).toBe(200);
+    expect(bad.json.data.rejected?.[0]?.path).toMatch(/^sessions\.0\.stats/);
+    expect(await db.get("SELECT id FROM sessions WHERE opencode_session_id = 'ses_bad'")).toBeTruthy();
+  });
+
+  it('counts answered approvals, and provider key changes as secure actions', async () => {
+    const token = await tokenFor('user-tier-4', 'tier4@example.com');
+    const desktop = await setupDesktop(token);
+    await syncSession(token, desktop, 'ses_appr', undefined);
+    const approvals = ['APPROVED', 'REJECTED', 'APPROVED', 'PENDING'].map((status, i) => ({
+      opencodeSessionId: 'ses_appr', requestId: `per_t${i}`, permission: 'bash', title: 'Run', patterns: [], status,
+    }));
+    const r = await call('POST', '/v1/sync', { token, deviceId: desktop.id, keys: desktop.keys, body: { approvals } });
+    expect(r.status).toBe(200);
+    const me = (await call('GET', '/v1/me', { token })).json.data;
+    await db.run('UPDATE users SET key_changes = 2 WHERE id = ?', me.id);
+    const byId = Object.fromEntries((await call('GET', '/v1/me/achievements', { token })).json.data.map((a: any) => [a.id, a]));
+    expect(byId['approvals'].value).toBe(3);
+    expect(byId['secure-actions']).toMatchObject({ value: 5, tier: 'bronze' });
   });
 });
 

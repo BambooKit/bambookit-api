@@ -144,6 +144,9 @@ commandsRouter.post('/:id/result', requireDevice('desktop'), async (c) => {
   const result = body.result === undefined ? null : JSON.stringify(body.result);
   if (result && result.length > 2_000_000) throw new HttpError(422, 'RESULT_TOO_LARGE', 'Command result too large');
   await db.run('UPDATE commands SET status = ?, result = ?, error = ?, updated_at = ? WHERE id = ?', body.status, result, body.error ?? null, now(), row.id);
+  if (body.status === 'SUCCEEDED' && (row.type === 'SET_PROVIDER_KEY' || row.type === 'REMOVE_PROVIDER_KEY')) {
+    await db.run('UPDATE users SET key_changes = COALESCE(key_changes, 0) + 1 WHERE id = ?', row.user_id);
+  }
   // Session content belongs on the PC: drop message text and file contents from finished commands,
   // and delete command records (including results such as file reads) once they are no longer needed.
   if (['SEND_MESSAGE', 'WRITE_FILE', 'CREATE_SESSION', 'QUESTION_REPLY', 'SET_PROVIDER_KEY'].includes(row.type)) await db.run("UPDATE commands SET payload = '{}' WHERE id = ?", row.id);

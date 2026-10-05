@@ -383,6 +383,8 @@ async function migrate(d: Database) {
     PRIMARY KEY (user_id, achievement)
   )`);
   await d.run('ALTER TABLE devices ADD COLUMN capabilities TEXT').catch(() => undefined);
+  // Provider API keys set or removed on a PC (succeeded commands), for the Secure Actions achievement.
+  await d.run('ALTER TABLE users ADD COLUMN key_changes INTEGER NOT NULL DEFAULT 0').catch(() => undefined);
   // Questions the agent asks (kind = 'question') travel through approvals with their options and answers.
   await d.run("ALTER TABLE approvals ADD COLUMN kind TEXT NOT NULL DEFAULT 'permission'").catch(() => undefined);
   await d.run('ALTER TABLE approvals ADD COLUMN questions TEXT').catch(() => undefined);

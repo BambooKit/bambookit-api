@@ -6,7 +6,7 @@ import { badRequest, stableId } from '../lib/http.js';
 import { logger } from '../lib/logger.js';
 import { emitEphemeral, publish } from '../realtime/bus.js';
 import { notify } from './notifications.js';
-import { refreshAchievements, trackWork } from './stats.js';
+import { refreshAchievementsSoon, trackWork } from './stats.js';
 import { serializeApproval, serializeProject, serializeSession } from './serializers.js';
 
 /**
@@ -49,6 +49,28 @@ export const sessionStatsSchema = z.object({
   commits: count,
   deployments: count,
   debugging: z.boolean().default(false),
+  // Desktop 1.0.6+: optional so older desktops keep syncing; absent means "not reported" (never counted as 0 proof).
+  prompts: count.optional(),
+  bugPrompts: count.optional(),
+  toolCalls: count.optional(),
+  terminalCommands: count.optional(),
+  subagentTasks: count.optional(),
+  mcpToolCalls: count.optional(),
+  mcpTools: z.array(z.string().max(100)).max(200).optional(),
+  agents: z.array(z.string().max(100)).max(50).optional(),
+  packagesInstalled: count.optional(),
+  branches: count.optional(),
+  merges: count.optional(),
+  pullRequests: count.optional(),
+  cloudDeployments: count.optional(),
+  cleanups: count.optional(),
+  docFiles: count.optional(),
+  refactoring: z.boolean().optional(),
+  review: z.boolean().optional(),
+  experiment: z.boolean().optional(),
+  retries: count.optional(),
+  firstTryPass: z.boolean().optional(),
+  activeSeconds: count.optional(),
 });
 
 const syncSchema = z.object({
@@ -372,6 +394,6 @@ syncRouter.post('/', async (c) => {
   for (const e of out) await publish(e);
   for (const e of live) emitEphemeral(e);
   for (const n of notes) await notify(n);
-  if (body.sessions?.length || body.projects?.length) await refreshAchievements(user.id);
+  if (body.sessions?.length || body.projects?.length) await refreshAchievementsSoon(user.id);
   return c.json({ data: { accepted: true, events: out.length, ...(rejected.length ? { rejected: rejected.slice(0, 50) } : {}) } });
 });
