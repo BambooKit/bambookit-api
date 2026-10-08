@@ -44,6 +44,24 @@ export const commandPayloads = {
   // Read or edit a file inside the session's project folder (the desktop enforces the folder boundary).
   READ_FILE: z.object({ path: z.string().min(1).max(1000) }),
   WRITE_FILE: z.object({ path: z.string().min(1).max(1000), content: z.string().max(1_000_000), baseSha256: z.string().max(64).nullable() }),
+  // API 1.3 (desktop capability approval-modes): the PC-wide approval mode, or with sessionId (the API's session
+  // id) an override for one session, where 'inherit' removes the override.
+  SET_APPROVAL_MODE: z
+    .object({ mode: z.enum(['ask', 'edits', 'all', 'inherit']), sessionId: z.string().min(1).max(200).optional() })
+    .strict()
+    .refine((p) => p.mode !== 'inherit' || !!p.sessionId, { message: "'inherit' needs a sessionId", path: ['mode'] }),
+  // API 1.3 (desktop capability keep-awake.remote): the same as the PC's coffee-cup button.
+  SET_KEEP_AWAKE: z.object({ on: z.boolean() }).strict(),
+  // Developer tools (owner-only). Gated by capability AND the PC's own "Allow remote control" switch.
+  // POWER (remote-power): the PC performs it after a 10-second on-screen cancelable countdown.
+  POWER: z.object({ action: z.enum(['sleep', 'shutdown', 'lock']).default('sleep') }).strict(),
+  // Terminal (remote-terminal): one shell per termId on the PC, in the project directory.
+  // TERMINAL_OPEN and TERMINAL_INPUT payloads are EPHEMERAL — never written to the events table or the commands
+  // table and never logged. Output streams back over the ephemeral 'terminal.data' event. Nothing is persisted.
+  TERMINAL_OPEN: z.object({ cols: z.number().int().min(1).max(1000), rows: z.number().int().min(1).max(1000) }).strict(),
+  TERMINAL_INPUT: z.object({ termId: z.string().min(1).max(200), data: z.string().max(100_000) }).strict(),
+  TERMINAL_RESIZE: z.object({ termId: z.string().min(1).max(200), cols: z.number().int().min(1).max(1000), rows: z.number().int().min(1).max(1000) }).strict(),
+  TERMINAL_CLOSE: z.object({ termId: z.string().min(1).max(200) }).strict(),
 } as const;
 
 export type CommandType = keyof typeof commandPayloads;
@@ -92,9 +110,12 @@ export async function createCommand(input: {
   );
   const command = serializeCommand(await commandRow(id));
   const event = { userId: input.userId, deviceId: desktop.id, sessionId: input.sessionId, type: 'command.created', payload: command };
-  // Encrypted provider keys are never written to the event log; an offline PC picks them up from its pending commands.
-  if (input.type === 'SET_PROVIDER_KEY') emitEphemeral(event);
+  // Encrypted provider keys and live terminal open/input are never written to the event log; an online PC receives
+  // them over its realtime stream (terminal is live-only; an offline PC never replays them).
+  if (input.type === 'SET_PROVIDER_KEY' || input.type === 'TERMINAL_OPEN' || input.type === 'TERMINAL_INPUT') emitEphemeral(event);
   else await publish(event);
+  // Terminal open/input carry live session data: their payload is never persisted — clear it from the commands row at once.
+  if (input.type === 'TERMINAL_OPEN' || input.type === 'TERMINAL_INPUT') await db.run("UPDATE commands SET payload = '{}' WHERE id = ?", id);
   return { command, deviceOnline: isConnected(desktop.id) };
 }
 
@@ -155,7 +176,7 @@ commandsRouter.post('/:id/result', requireDevice('desktop'), async (c) => {
   if (['PERMISSION_REPLY', 'QUESTION_REPLY', 'QUESTION_REJECT'].includes(row.type) && body.status === 'FAILED') {
     // Let the user try again.
     await db.run(
-      "UPDATE approvals SET status = 'PENDING' WHERE device_id = ? AND opencode_request_id = ? AND status = 'RESPONDING'",
+      "UPDATE approvals SET status = 'PENDING', resolved_by = NULL WHERE device_id = ? AND opencode_request_id = ? AND status = 'RESPONDING'",
       device.id,
       JSON.parse(row.payload).requestId,
     );

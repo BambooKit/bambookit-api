@@ -4,8 +4,8 @@ import { createPublicKey } from 'node:crypto';
 import { db, now } from '../db/database.js';
 import { requireDevice, requireSignature, requireUser, type AppEnv, type DeviceRow } from '../middleware/auth.js';
 import { HttpError, badRequest, forbidden, notFound, stableId } from '../lib/http.js';
-import { publish } from '../realtime/bus.js';
-import { COMMAND_SELECT, serializeCommand, serializeDevice } from './serializers.js';
+import { emitEphemeral, publish } from '../realtime/bus.js';
+import { COMMAND_SELECT, deviceSettings, serializeCommand, serializeDevice } from './serializers.js';
 import { createCommand, expireStaleCommands, resolveIssuer } from './commands.js';
 import { relay } from './relay.js';
 import { requireCapability } from '../lib/compat.js';
@@ -25,6 +25,9 @@ const registerSchema = z.discriminatedUnion('kind', [
     encryptionKey: z.string().min(200).max(4000).optional(),
     protocol: z.number().int().min(1).max(1000).optional(),
     capabilities: z.array(z.string().max(60)).max(100).optional(),
+    // API 1.3: the PC's approval mode, keep-awake state and remote-control switch (missing fields keep what was
+    // reported before). allowRemoteControl can only be turned on physically at the PC, so it is reported, never set remotely.
+    settings: z.object({ approvalMode: z.enum(['ask', 'edits', 'all']), keepAwake: z.boolean(), allowRemoteControl: z.boolean() }).partial().optional(),
   }),
   z.object({
     kind: z.literal('mobile'),
@@ -99,6 +102,16 @@ devicesRouter.post('/register', async (c) => {
     ts,
   );
 
+  if (body.kind === 'desktop' && body.settings) {
+    const before = existing ? deviceSettings(existing) : null;
+    const settings = { ...(before ?? { approvalMode: 'ask', keepAwake: false, allowRemoteControl: false }), ...body.settings };
+    await db.run('UPDATE devices SET settings = ? WHERE id = ?', JSON.stringify(settings), id);
+    // Live only: phones and the website update the PC card (the device list carries the stored value).
+    if (existing && JSON.stringify(before) !== JSON.stringify(settings)) {
+      emitEphemeral({ userId: user.id, deviceId: id, type: 'device.updated', payload: { deviceId: id, settings } });
+    }
+  }
+
   const device = await serializeDevice((await getDevice(id))!);
   if (!existing) await publish({ userId: user.id, deviceId: id, type: 'device.registered', payload: device });
   return c.json({ data: device }, existing ? 200 : 201);
@@ -163,8 +176,14 @@ devicesRouter.post('/:id/unlink', async (c) => {
   return c.json({ data: { unlinked: true } });
 });
 
-// Commands about the PC itself rather than one session (provider keys).
-const deviceCommandTypes = ['SET_PROVIDER_KEY', 'REMOVE_PROVIDER_KEY'] as const;
+// Commands about the PC itself rather than one session (provider keys, developer-tools relay).
+const deviceCommandTypes = [
+  'SET_PROVIDER_KEY', 'REMOVE_PROVIDER_KEY', 'SET_APPROVAL_MODE', 'SET_KEEP_AWAKE',
+  'POWER', 'TERMINAL_OPEN', 'TERMINAL_INPUT', 'TERMINAL_RESIZE', 'TERMINAL_CLOSE',
+] as const;
+
+// Developer tools that remote-control the owner's own PC: gated by a capability AND by the PC's own switch.
+const TERMINAL_COMMANDS = new Set(['TERMINAL_OPEN', 'TERMINAL_INPUT', 'TERMINAL_RESIZE', 'TERMINAL_CLOSE']);
 
 // POST /v1/devices/:id/commands { type, payload } — from a paired phone or the website
 devicesRouter.post('/:id/commands', async (c) => {
@@ -174,7 +193,28 @@ devicesRouter.post('/:id/commands', async (c) => {
   const body = z.object({ type: z.enum(deviceCommandTypes), payload: z.unknown().optional() }).parse(await c.req.json());
   // Never send encrypted credentials to a PC that cannot read them.
   if (body.type === 'SET_PROVIDER_KEY') requireCapability(desktop, 'providerKeys');
-  const res = await createCommand({ userId: user.id, desktop, sessionId: null, issuer: await resolveIssuer(user.id, c.req.header('X-BK-Device-Id')), type: body.type, payload: body.payload ?? {} });
+  if (body.type === 'SET_APPROVAL_MODE') requireCapability(desktop, 'approvalMode');
+  if (body.type === 'SET_KEEP_AWAKE') requireCapability(desktop, 'keepAwake');
+  // Power and terminal only reach a desktop new enough (426) that the owner has switched on for remote control (403).
+  if (body.type === 'POWER') requireCapability(desktop, 'remotePower');
+  if (TERMINAL_COMMANDS.has(body.type)) requireCapability(desktop, 'remoteTerminal');
+  if (body.type === 'POWER' || TERMINAL_COMMANDS.has(body.type)) {
+    if (deviceSettings(desktop)?.allowRemoteControl !== true) {
+      throw new HttpError(403, 'REMOTE_CONTROL_DISABLED', `Turn on remote control on ${desktop.name} first.`, { device: desktop.name });
+    }
+  }
+  // A per-session approval mode names one of this PC's sessions; the command then carries its target.
+  let sessionId: string | null = null;
+  if (body.type === 'SET_APPROVAL_MODE') {
+    const named = (body.payload as any)?.sessionId;
+    if (typeof named === 'string' && named) {
+      const session = await db.get<{ id: string; device_id: string }>('SELECT id, device_id FROM sessions WHERE id = ? AND user_id = ?', named, user.id);
+      if (!session) throw notFound('Session');
+      if (session.device_id !== desktop.id) throw badRequest('That session is on another PC', 'SESSION_ON_OTHER_DEVICE');
+      sessionId = session.id;
+    }
+  }
+  const res = await createCommand({ userId: user.id, desktop, sessionId, issuer: await resolveIssuer(user.id, c.req.header('X-BK-Device-Id')), type: body.type, payload: body.payload ?? {} });
   return c.json({ data: res.command, deviceOnline: res.deviceOnline }, 202);
 });
 
@@ -193,4 +233,14 @@ devicesRouter.get('/:id/commands', requireDevice('desktop'), async (c) => {
   await expireStaleCommands(device.id);
   const rows = await db.all(`${COMMAND_SELECT} WHERE c.device_id = ? AND c.status = 'PENDING' ORDER BY c.created_at ASC LIMIT 100`, device.id);
   return c.json({ data: rows.map(serializeCommand) });
+});
+
+// POST /v1/devices/:id/terminal — the PC streams terminal output back to the owner's phone/web (signed).
+// Ephemeral device → user channel 'terminal.data' (seq -1): never written to the events table and never logged.
+devicesRouter.post('/:id/terminal', requireDevice('desktop'), async (c) => {
+  const device = c.get('device')!;
+  if (device.id !== c.req.param('id')) throw forbidden('Devices can only stream their own terminal');
+  const { termId, data } = z.object({ termId: z.string().min(1).max(200), data: z.string().max(500_000) }).parse(JSON.parse(await c.req.text()));
+  emitEphemeral({ userId: device.user_id, deviceId: device.id, type: 'terminal.data', payload: { termId, data } });
+  return c.json({ data: { delivered: true } });
 });

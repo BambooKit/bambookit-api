@@ -16,7 +16,7 @@ export const loggingMiddleware: MiddlewareHandler = async (c, next) => {
 
   const duration = Date.now() - start;
   const status = c.res.status;
-  recordRequest(status);
+  recordRequest(status, c.get('expectedError') === true);
 
   logger.info(`${c.req.method} ${c.req.path} ${status} - ${duration}ms`, {
     requestId,

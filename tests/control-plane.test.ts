@@ -1898,3 +1898,380 @@ describe('plans, limits, payments and rewarded ads', () => {
     }
   });
 });
+
+describe('API 1.3: PC settings, approval modes, keep awake, approvals history, files changed, releases', () => {
+  const CAPS = ['relay.transcript', 'relay.changes', 'questions', 'approval-modes', 'keep-awake.remote'];
+
+  async function newDesktop(token: string, extra: Record<string, unknown> = {}) {
+    const keys = desktopKeys();
+    const body = { kind: 'desktop', name: 'New PC', platform: 'windows', appVersion: '1.0.8', publicKey: keys.publicPem, capabilities: CAPS, ...extra };
+    const res = await call('POST', '/v1/devices/register', { token, keys, body });
+    expect(res.status).toBe(201);
+    return { keys, id: res.json.data.id as string, body, device: res.json.data };
+  }
+
+  it('stores the settings a PC reports, lists them, and announces changes live', async () => {
+    const token = await tokenFor('user-13-settings', 's13@example.com');
+    const bus = await import('../src/realtime/bus.js');
+    const events: any[] = [];
+    const off = bus.subscribe('user-13-settings', (e) => events.push(e));
+    const pc = await newDesktop(token, { settings: { approvalMode: 'edits', keepAwake: false } });
+    expect(pc.device.settings).toMatchObject({ approvalMode: 'edits', keepAwake: false });
+    const old = await setupDesktop(token); // reports no settings
+    const list = (await call('GET', '/v1/devices', { token })).json.data;
+    expect(list.find((d: any) => d.id === pc.id).settings).toMatchObject({ approvalMode: 'edits', keepAwake: false });
+    expect(list.find((d: any) => d.id === old.id).settings).toBeNull();
+
+    // Re-registering with the same settings is quiet; a change emits an ephemeral device.updated.
+    await call('POST', '/v1/devices/register', { token, keys: pc.keys, body: pc.body });
+    expect(events.filter((e) => e.type === 'device.updated')).toHaveLength(0);
+    const changed = await call('POST', '/v1/devices/register', { token, keys: pc.keys, body: { ...pc.body, settings: { keepAwake: true } } });
+    expect(changed.status).toBe(200);
+    expect(changed.json.data.settings).toMatchObject({ approvalMode: 'edits', keepAwake: true });
+    const updates = events.filter((e) => e.type === 'device.updated');
+    expect(updates).toHaveLength(1);
+    expect(updates[0].seq).toBe(-1);
+    expect(updates[0].payload).toMatchObject({ deviceId: pc.id, settings: { approvalMode: 'edits', keepAwake: true } });
+    off();
+
+    const bad = await call('POST', '/v1/devices/register', { token, keys: pc.keys, body: { ...pc.body, settings: { approvalMode: 'never' } } });
+    expect(bad.status).toBe(400);
+  });
+
+  it('sends SET_APPROVAL_MODE and SET_KEEP_AWAKE only to PCs that support them, with validated payloads', async () => {
+    const token = await tokenFor('user-13-cmd', 'c13@example.com');
+    const pc = await newDesktop(token);
+    const old = await setupDesktop(token); // 1.0.3, no capabilities reported
+    const { mobileId } = await pairPhone(token, pc);
+    const send = (id: string, type: string, payload: unknown, deviceId?: string) => call('POST', `/v1/devices/${id}/commands`, { token, deviceId, body: { type, payload } });
+
+    const oldMode = await send(old.id, 'SET_APPROVAL_MODE', { mode: 'all' });
+    expect(oldMode.status).toBe(426);
+    expect(oldMode.json.error.details).toMatchObject({ capability: 'approval-modes', requiredVersion: '1.0.8' });
+    const oldAwake = await send(old.id, 'SET_KEEP_AWAKE', { on: true });
+    expect(oldAwake.status).toBe(426);
+    expect(oldAwake.json.error.details).toMatchObject({ capability: 'keep-awake.remote', requiredVersion: '1.0.8' });
+
+    expect((await send(pc.id, 'SET_APPROVAL_MODE', { mode: 'sometimes' })).status).toBe(400);
+    expect((await send(pc.id, 'SET_APPROVAL_MODE', { mode: 'inherit' })).status).toBe(400);
+    expect((await send(pc.id, 'SET_KEEP_AWAKE', { on: 'yes' })).status).toBe(400);
+    expect((await send(pc.id, 'SET_KEEP_AWAKE', {})).status).toBe(400);
+
+    const mode = await send(pc.id, 'SET_APPROVAL_MODE', { mode: 'edits' }, mobileId);
+    expect(mode.status).toBe(202);
+    expect(mode.json.data).toMatchObject({ type: 'SET_APPROVAL_MODE', payload: { mode: 'edits' }, target: null });
+    const awake = await send(pc.id, 'SET_KEEP_AWAKE', { on: true });
+    expect(awake.status).toBe(202);
+    expect(awake.json.data.payload).toEqual({ on: true });
+
+    // A per-session override names the API session and carries the session's target for the PC.
+    await call('POST', '/v1/sync', { token, deviceId: pc.id, keys: pc.keys, body: { sessions: [{ opencodeSessionId: 'ses_13_cmd', directory: 'C:/p13', title: 'S', status: 'idle' }] } });
+    await call('POST', '/v1/sync', { token, deviceId: old.id, keys: old.keys, body: { sessions: [{ opencodeSessionId: 'ses_13_old', directory: 'C:/o13', title: 'O', status: 'idle' }] } });
+    const sessions = (await call('GET', '/v1/sessions', { token })).json.data;
+    const mine = sessions.find((s: any) => s.deviceId === pc.id);
+    const other = sessions.find((s: any) => s.deviceId === old.id);
+    const inherit = await send(pc.id, 'SET_APPROVAL_MODE', { mode: 'inherit', sessionId: mine.id });
+    expect(inherit.status).toBe(202);
+    expect(inherit.json.data.target).toEqual({ opencodeSessionId: 'ses_13_cmd', directory: 'C:/p13' });
+    expect((await send(pc.id, 'SET_APPROVAL_MODE', { mode: 'all', sessionId: other.id })).json.error.code).toBe('SESSION_ON_OTHER_DEVICE');
+    expect((await send(pc.id, 'SET_APPROVAL_MODE', { mode: 'all', sessionId: 'ses_missing' })).status).toBe(404);
+
+    const pending = await call('GET', `/v1/devices/${pc.id}/commands`, { token, deviceId: pc.id, keys: pc.keys });
+    expect(pending.json.data.map((c: any) => c.type)).toEqual(['SET_APPROVAL_MODE', 'SET_KEEP_AWAKE', 'SET_APPROVAL_MODE']);
+
+    const meta = (await call('GET', '/v1/meta')).json.data;
+    expect(meta.apiVersion).toBe('1.3.0');
+    expect(meta.desktopRequirements.approvalMode).toMatchObject({ capability: 'approval-modes', since: '1.0.8' });
+    expect(meta.desktopRequirements.keepAwake).toMatchObject({ capability: 'keep-awake.remote', since: '1.0.8' });
+  });
+
+  it('keeps auto-approved and resolved requests as history with who resolved them, paged newest first', async () => {
+    const token = await tokenFor('user-13-hist', 'h13@example.com');
+    const pc = await newDesktop(token);
+    const { mobileId } = await pairPhone(token, pc);
+    const sync = (body: unknown) => call('POST', '/v1/sync', { token, deviceId: pc.id, keys: pc.keys, body });
+    const ses = { opencodeSessionId: 'ses_13_h', directory: 'C:/h13', title: 'History', status: 'busy' };
+    const apr = (requestId: string, extra: Record<string, unknown> = {}) => ({ opencodeSessionId: 'ses_13_h', requestId, permission: 'edit', title: `edit ${requestId}`, status: 'PENDING', ...extra });
+
+    expect((await sync({ sessions: [ses], approvals: [apr('auto_1', { status: 'APPROVED', reply: 'once', resolvedBy: 'auto' })] })).status).toBe(200);
+    await sync({ approvals: [apr('auto_2', { status: 'APPROVED', reply: 'once', resolvedBy: 'auto' })] });
+    await sync({ approvals: [apr('ask_1', { permission: 'bash' }), apr('ask_2', { permission: 'bash' }), apr('pc_1')] });
+    await sync({ approvals: [apr('q_1', { kind: 'question', questions: [{ question: 'Which?', options: [{ label: 'A' }] }] })] });
+
+    // Auto-approved requests never notify.
+    const notes = (await call('GET', '/v1/notifications', { token })).json.data.map((n: any) => n.data?.approvalId).filter(Boolean);
+    expect(notes).toHaveLength(4);
+
+    // Default (no status) is unchanged: everything, as a plain list.
+    const legacy = await call('GET', '/v1/approvals', { token });
+    expect(legacy.json.data).toHaveLength(6);
+    expect((await call('GET', '/v1/approvals?status=PENDING', { token })).json.data).toHaveLength(4);
+    expect((await call('GET', '/v1/approvals?status=pending', { token })).json.data).toHaveLength(4);
+
+    // Answered from the phone: resolvedBy 'phone' once the PC confirms.
+    const ask1 = legacy.json.data.find((a: any) => a.opencodeRequestId === 'ask_1');
+    const claim = await call('POST', `/v1/approvals/${ask1.id}/respond`, { token, deviceId: mobileId, body: { reply: 'once' } });
+    expect(claim.json.data).toMatchObject({ status: 'RESPONDING', resolvedBy: null });
+    // Answered on the website; on the PC; a question answered (never 'auto'); everything else expired.
+    const ask2 = legacy.json.data.find((a: any) => a.opencodeRequestId === 'ask_2');
+    await call('POST', `/v1/approvals/${ask2.id}/respond`, { token, body: { reply: 'reject' } });
+    await sync({
+      approvals: [
+        apr('ask_1', { permission: 'bash', status: 'APPROVED', reply: 'once' }),
+        apr('ask_2', { permission: 'bash', status: 'REJECTED', reply: 'reject' }),
+        apr('pc_1', { status: 'APPROVED', reply: 'always', resolvedBy: 'pc' }),
+        apr('q_1', { kind: 'question', status: 'ANSWERED', reply: 'answer', answers: [['A']], resolvedBy: 'auto' }),
+      ],
+      pendingApprovalSnapshot: [],
+    });
+
+    const resolved = (await call('GET', '/v1/approvals?status=resolved', { token })).json;
+    const by = Object.fromEntries(resolved.data.map((a: any) => [a.opencodeRequestId, [a.status, a.resolvedBy]]));
+    expect(by).toEqual({
+      auto_1: ['APPROVED', 'auto'],
+      auto_2: ['APPROVED', 'auto'],
+      ask_1: ['APPROVED', 'phone'],
+      ask_2: ['REJECTED', 'web'],
+      pc_1: ['APPROVED', 'pc'],
+      q_1: ['ANSWERED', 'pc'],
+    });
+    expect(resolved.data.every((a: any) => a.resolvedAt && a.sessionTitle === 'History' && a.deviceId === pc.id && a.sessionId && a.kind && 'title' in a)).toBe(true);
+    expect(resolved.nextCursor).toBeNull();
+    expect((await call('GET', '/v1/approvals?status=pending', { token })).json.data).toHaveLength(0);
+
+    // Paging: newest first, no repeats, nextCursor null at the end.
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const page: any = (await call('GET', `/v1/approvals?status=all&limit=4${cursor ? `&before=${encodeURIComponent(cursor)}` : ''}`, { token })).json;
+      seen.push(...page.data.map((a: any) => a.id));
+      cursor = page.nextCursor;
+      pages++;
+    } while (cursor && pages < 10);
+    expect(pages).toBe(2);
+    expect(new Set(seen).size).toBe(6);
+    expect((await call('GET', '/v1/approvals?status=all&before=nonsense', { token })).json.error.code).toBe('INVALID_CURSOR');
+    expect((await call('GET', '/v1/approvals?status=all&limit=0', { token })).status).toBe(400);
+
+    // Resolved items are listed for 30 days; auto approvals older than that are deleted on the next auto sync.
+    const old = new Date(Date.now() - 31 * 86_400_000).toISOString();
+    await db.run("UPDATE approvals SET resolved_at = ?, created_at = ? WHERE user_id = ? AND opencode_request_id IN ('auto_1', 'pc_1')", old, old, 'user-13-hist');
+    expect((await call('GET', '/v1/approvals?status=resolved', { token })).json.data).toHaveLength(4);
+    await sync({ approvals: [apr('auto_3', { status: 'APPROVED', reply: 'once', resolvedBy: 'auto' })] });
+    const left = (await db.all<any>('SELECT opencode_request_id AS r FROM approvals WHERE user_id = ?', 'user-13-hist')).map((r) => r.r).sort();
+    expect(left).toEqual(['ask_1', 'ask_2', 'auto_2', 'auto_3', 'pc_1', 'q_1']);
+
+    // The PC approving by itself is not the user answering.
+    const stats = (await call('GET', '/v1/me/stats', { token })).json.data;
+    expect(stats.activity.approvalsAnswered).toBe(3);
+  });
+
+  it('counts files changed in the last 24 hours once, from sessions with real activity', async () => {
+    const token = await tokenFor('user-13-files', 'f13@example.com');
+    const pc = await newDesktop(token);
+    const sync = (body: unknown) => call('POST', '/v1/sync', { token, deviceId: pc.id, keys: pc.keys, body });
+    const s = (id: string, extra: Record<string, unknown> = {}) => ({ opencodeSessionId: id, directory: 'C:\\work\\app', title: id, status: 'idle', ...extra });
+    const diff = (id: string, files: string[]) => ({ opencodeSessionId: id, files: files.map((file) => ({ file, additions: 1, deletions: 0 })) });
+    const overview = async () => (await call('GET', '/v1/overview', { token })).json.data;
+
+    await sync({ sessions: [s('a', { status: 'busy', files: 3 }), s('b', { status: 'busy', files: 2 }), s('c', { files: 2, status: 'busy' })] });
+    // The same file seen as a relative and an absolute path, and in two sessions, counts once.
+    await sync({ diffs: [diff('a', ['src/x.ts', 'src/y.ts', 'README.md']), diff('b', ['src/y.ts', 'C:\\work\\app\\src\\z.ts'])] });
+    // An old session the PC re-sends unchanged in every snapshot does not count.
+    await sync({ sessions: [s('old', { files: 40, createdAt: new Date(Date.now() - 5 * 86_400_000).toISOString() })] });
+    await sync({ sessions: [s('old', { files: 40 })] });
+    // A desktop that reports the engine's update time: an old one is not recent activity.
+    await sync({ sessions: [s('reported', { files: 7, updatedAt: Date.now() - 3 * 86_400_000 })] });
+
+    // a ∪ b = x, y, README, z (4) + c without a recorded diff (2).
+    const o = await overview();
+    expect(o.filesChanged24h).toBe(6);
+    expect(o.recentChangedFiles).toBe(6);
+    expect((await call('GET', '/v1/me/stats', { token })).json.data.filesChanged24h).toBe(6);
+
+    // A snapshot that re-sends the same sessions (now idle) keeps them in the window; nothing is counted twice.
+    await sync({ sessions: [s('a', { files: 3 }), s('b', { files: 2 }), s('c', { files: 2 }), s('old', { files: 40 })] });
+    expect((await overview()).filesChanged24h).toBe(6);
+
+    // Activity more than 24 h ago leaves the window; a change brings the session back.
+    const dayAgo = new Date(Date.now() - 25 * 3_600_000).toISOString();
+    await db.run("UPDATE sessions SET activity_at = ? WHERE user_id = ? AND opencode_session_id IN ('a', 'c')", dayAgo, 'user-13-files');
+    await sync({ sessions: [s('a', { files: 3 }), s('c', { files: 2 })] });
+    expect((await overview()).filesChanged24h).toBe(2); // y and z, from b
+    await sync({ sessions: [s('c', { files: 5 })] });
+    expect((await overview()).filesChanged24h).toBe(7);
+
+    // Removing a session removes its file keys; no paths are stored.
+    await sync({ removedSessions: ['b'] });
+    expect((await overview()).filesChanged24h).toBe(5);
+    const keys = await db.all<any>('SELECT file_key FROM session_files WHERE user_id = ?', 'user-13-files');
+    expect(keys.length).toBe(3);
+    expect(JSON.stringify(keys)).not.toMatch(/src|README|work/);
+  });
+
+  it('serves releases for every platform, falls back to the last good answer, and never alerts on GitHub outages', async () => {
+    const meta = await import('../src/modules/meta.js');
+    const monitor = await import('../src/lib/monitor.js');
+    const { env } = await import('../src/config/env.js');
+    meta.resetReleaseCache();
+    const realFetch = globalThis.fetch;
+    const seen: Array<{ url: string; auth: string | null }> = [];
+    let mode: 'ok' | 'down' | 'limited' = 'ok';
+    globalThis.fetch = (async (url: any, init: any = {}) => {
+      const u = String(url);
+      if (!u.startsWith('https://api.github.com/')) return realFetch(url, init);
+      seen.push({ url: u, auth: init.headers?.Authorization ?? null });
+      if (mode === 'down') throw new TypeError('fetch failed');
+      if (mode === 'limited') return new Response('{"message":"API rate limit exceeded"}', { status: 403 });
+      const asset = (name: string) => ({ name, browser_download_url: `https://github.com/dl/${name}`, size: 10 });
+      if (u.includes('bambookit-android')) return Response.json({ tag_name: 'v1.0.9', name: 'Android', published_at: null, body: '', html_url: 'https://github.com/a', assets: [asset('BambooKit-1.0.9.apk')] });
+      return Response.json({
+        tag_name: 'v1.0.8', name: 'Desktop', published_at: '2026-10-01T00:00:00Z', body: 'notes', html_url: 'https://github.com/d',
+        assets: ['BambooKit-Setup-1.0.8.exe', 'BambooKit-Setup-1.0.8.exe.blockmap', 'BambooKit-1.0.8-x64.dmg', 'BambooKit-1.0.8-arm64.dmg', 'BambooKit-1.0.8-arm64-mac.zip', 'BambooKit-1.0.8.deb', 'BambooKit-1.0.8.AppImage', 'latest-mac.yml'].map(asset),
+      });
+    }) as typeof fetch;
+    const get = (platform: string) => call('GET', `/v1/releases/latest?platform=${platform}`);
+    try {
+      env.GITHUB_TOKEN = 'test-github-token';
+      const win = (await get('windows')).json.data;
+      expect(win).toMatchObject({ platform: 'windows', version: '1.0.8', stale: false, download: { name: 'BambooKit-Setup-1.0.8.exe' } });
+      const mac = (await get('mac')).json.data;
+      expect(mac.download.name).toBe('BambooKit-1.0.8-arm64.dmg');
+      expect(mac.downloads.map((d: any) => d.name)).toEqual(['BambooKit-1.0.8-arm64.dmg', 'BambooKit-1.0.8-arm64-mac.zip']);
+      const linux = (await get('linux')).json.data;
+      expect(linux.downloads.map((d: any) => d.name)).toEqual(['BambooKit-1.0.8.AppImage', 'BambooKit-1.0.8.deb']);
+      expect((await get('android')).json.data.download.name).toBe('BambooKit-1.0.9.apk');
+      expect((await get('ios')).status).toBe(400);
+      // One GitHub call per repository (mac, linux and windows share the desktop release), with the token.
+      expect(seen).toHaveLength(2);
+      expect(seen.every((s) => s.auth === 'Bearer test-github-token')).toBe(true);
+
+      // GitHub down or rate limited after the cache expired: the last good answer, marked stale.
+      const later = Date.now() + 11 * 60_000;
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
+      try {
+        mode = 'limited';
+        expect((await get('linux')).json.data).toMatchObject({ version: '1.0.8', stale: true, download: { name: 'BambooKit-1.0.8.AppImage' } });
+        mode = 'down';
+        expect((await get('android')).json.data).toMatchObject({ version: '1.0.9', stale: true });
+      } finally {
+        clock.mockRestore();
+      }
+
+      // Nothing ever fetched: 503, an expected outcome (no alert, not counted as a server error).
+      meta.resetReleaseCache();
+      const before = { errors: monitor.serverErrorsSince(86_400_000), counted: monitor.health().serverErrors };
+      const down = await get('mac');
+      expect(down.status).toBe(503);
+      expect(down.json.error.code).toBe('UPDATE_SOURCE_UNAVAILABLE');
+      expect(monitor.serverErrorsSince(86_400_000)).toBe(before.errors);
+      expect(monitor.health().serverErrors).toBe(before.counted);
+      expect(JSON.stringify(down.json)).not.toContain('test-github-token');
+    } finally {
+      globalThis.fetch = realFetch;
+      env.GITHUB_TOKEN = undefined;
+      meta.resetReleaseCache();
+    }
+  });
+});
+
+describe('API 1.3: developer tools (owner-only remote power and terminal)', () => {
+  const DEV_CAPS = ['relay.transcript', 'questions', 'remote-power', 'remote-terminal'];
+
+  async function devDesktop(token: string, settings?: Record<string, unknown>) {
+    const keys = desktopKeys();
+    const body: Record<string, unknown> = { kind: 'desktop', name: 'Dev PC', platform: 'windows', appVersion: '1.3.0', publicKey: keys.publicPem, capabilities: DEV_CAPS };
+    if (settings) body.settings = settings;
+    const res = await call('POST', '/v1/devices/register', { token, keys, body });
+    expect(res.status).toBe(201);
+    return { keys, id: res.json.data.id as string, body, device: res.json.data };
+  }
+
+  it('gates power/terminal by capability (426) and by the PC\'s own remote-control switch (403)', async () => {
+    const token = await tokenFor('user-dev-1', 'dev1@example.com');
+    const old = await setupDesktop(token); // 1.0.3, reports no remote-* capability
+    const off = await devDesktop(token); // capable, but remote control not switched on at the PC
+    const send = (id: string, type: string, payload: unknown) => call('POST', `/v1/devices/${id}/commands`, { token, body: { type, payload } });
+
+    // Too-old desktop: 426 DESKTOP_UPDATE_REQUIRED naming the missing capability, before the remote-control check.
+    const oldPower = await send(old.id, 'POWER', { action: 'sleep' });
+    expect(oldPower.status).toBe(426);
+    expect(oldPower.json.error.code).toBe('DESKTOP_UPDATE_REQUIRED');
+    expect(oldPower.json.error.details.capability).toBe('remote-power');
+    expect((await send(old.id, 'TERMINAL_OPEN', { cols: 80, rows: 24 })).json.error.details.capability).toBe('remote-terminal');
+
+    // Capable desktop with remote control OFF: 403 REMOTE_CONTROL_DISABLED for every dev-tools command.
+    for (const [type, payload] of [
+      ['POWER', { action: 'shutdown' }],
+      ['TERMINAL_OPEN', { cols: 80, rows: 24 }],
+      ['TERMINAL_INPUT', { termId: 't1', data: 'ls' }],
+      ['TERMINAL_RESIZE', { termId: 't1', cols: 100, rows: 30 }],
+      ['TERMINAL_CLOSE', { termId: 't1' }],
+    ] as const) {
+      const res = await send(off.id, type, payload);
+      expect(res.status).toBe(403);
+      expect(res.json.error.code).toBe('REMOTE_CONTROL_DISABLED');
+      expect(res.json.error.details).toMatchObject({ device: 'Dev PC' });
+    }
+  });
+
+  it('accepts power/terminal when remote control is on, keeps terminal payloads out of events, logs and the db, and relays terminal.data', async () => {
+    const token = await tokenFor('user-dev-2', 'dev2@example.com');
+    const pc = await devDesktop(token, { allowRemoteControl: true });
+    expect(pc.device.settings).toMatchObject({ allowRemoteControl: true });
+    const { mobileId } = await pairPhone(token, pc);
+
+    // A normal paired desktop with remote control ON accepts POWER from the paired phone (default action 'sleep').
+    const power = await call('POST', `/v1/devices/${pc.id}/commands`, { token, deviceId: mobileId, body: { type: 'POWER', payload: {} } });
+    expect(power.status).toBe(202);
+    expect(power.json.data).toMatchObject({ type: 'POWER', payload: { action: 'sleep' } });
+
+    // With remote control on, payloads are strictly validated (bad action / zero size → 400).
+    expect((await call('POST', `/v1/devices/${pc.id}/commands`, { token, body: { type: 'POWER', payload: { action: 'explode' } } })).status).toBe(400);
+    expect((await call('POST', `/v1/devices/${pc.id}/commands`, { token, body: { type: 'TERMINAL_OPEN', payload: { cols: 0, rows: 24 } } })).status).toBe(400);
+
+    const bus = await import('../src/realtime/bus.js');
+    const stream: any[] = [];
+    const offBus = bus.subscribe('user-dev-2', (e) => stream.push(e));
+    const open = await call('POST', `/v1/devices/${pc.id}/commands`, { token, body: { type: 'TERMINAL_OPEN', payload: { cols: 120, rows: 40 } } });
+    expect(open.status).toBe(202);
+
+    const SECRET = 'SECRET_sudo_whoami_' + randomUUID();
+    const logs: string[] = [];
+    const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map((m) => vi.spyOn(console, m).mockImplementation((...a: any[]) => { logs.push(a.map(String).join(' ')); }));
+    const input = await call('POST', `/v1/devices/${pc.id}/commands`, { token, body: { type: 'TERMINAL_INPUT', payload: { termId: 'term-1', data: SECRET } } });
+    spies.forEach((s) => s.mockRestore());
+    expect(input.status).toBe(202);
+    offBus();
+
+    // TERMINAL_OPEN/INPUT are delivered live over the stream (seq -1) but never written to the events table.
+    const openEvt = stream.find((e) => e.type === 'command.created' && e.payload.type === 'TERMINAL_OPEN');
+    expect(openEvt?.seq).toBe(-1);
+    expect((await db.get("SELECT COUNT(*) AS n FROM events WHERE user_id = 'user-dev-2' AND type = 'command.created' AND payload LIKE '%TERMINAL_%'")).n).toBe(0);
+    expect((await db.get('SELECT COUNT(*) AS n FROM events WHERE payload LIKE ?', `%${SECRET}%`)).n).toBe(0);
+    // The input data is never persisted in the commands table either: the payload is cleared immediately.
+    expect((await db.get("SELECT payload FROM commands WHERE device_id = ? AND type = 'TERMINAL_INPUT'", pc.id)).payload).toBe('{}');
+    expect((await db.get("SELECT payload FROM commands WHERE device_id = ? AND type = 'TERMINAL_OPEN'", pc.id)).payload).toBe('{}');
+    // And it is never logged.
+    expect(logs.join('\n')).not.toContain(SECRET);
+
+    // The PC streams terminal output back over the ephemeral device → user channel 'terminal.data' (seq -1).
+    const got: any[] = [];
+    const off2 = bus.subscribe('user-dev-2', (e) => { if (e.type === 'terminal.data') got.push(e); });
+    const out = await call('POST', `/v1/devices/${pc.id}/terminal`, { token, deviceId: pc.id, keys: pc.keys, body: { termId: 'term-1', data: 'hello from the shell' } });
+    off2();
+    expect(out.status).toBe(200);
+    expect(got).toHaveLength(1);
+    expect(got[0].seq).toBe(-1);
+    expect(got[0].payload).toEqual({ termId: 'term-1', data: 'hello from the shell' });
+    // Terminal output is never stored.
+    expect((await db.get("SELECT COUNT(*) AS n FROM events WHERE type = 'terminal.data'")).n).toBe(0);
+
+    // Another account cannot drive this PC.
+    const other = await tokenFor('user-dev-3', 'dev3@example.com');
+    expect((await call('POST', `/v1/devices/${pc.id}/commands`, { token: other, body: { type: 'POWER', payload: {} } })).status).toBe(404);
+    // And a signed terminal stream from a stranger's key cannot target it either.
+    expect((await call('POST', `/v1/devices/${pc.id}/terminal`, { token: other, deviceId: pc.id, keys: pc.keys, body: { termId: 'term-1', data: 'x' } })).status).toBe(403);
+  });
+});

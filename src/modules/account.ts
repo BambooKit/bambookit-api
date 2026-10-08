@@ -4,6 +4,7 @@ import { db } from '../db/database.js';
 import { requireUser, type AppEnv, type DeviceRow } from '../middleware/auth.js';
 import { rowToEvent } from '../realtime/bus.js';
 import { serializeDevice, serializeSession } from './serializers.js';
+import { filesChanged24h } from './stats.js';
 
 export const accountRouter = new Hono<AppEnv>();
 accountRouter.use('*', requireUser);
@@ -21,14 +22,16 @@ accountRouter.get('/overview', async (c) => {
       WHERE s.user_id = ? AND s.status IN ('busy','retry') AND s.parent_opencode_session_id IS NULL ORDER BY s.updated_at DESC`,
     userId,
   );
-  const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
+  const changed24h = await filesChanged24h(userId);
   return c.json({
     data: {
       desktops: devices.filter((d) => d.kind === 'desktop'),
       mobiles: devices.filter((d) => d.kind === 'mobile'),
       activeSessions: active.map(serializeSession),
       pendingApprovals: await count("SELECT COUNT(*) AS n FROM approvals WHERE user_id = ? AND status IN ('PENDING','RESPONDING')", userId),
-      recentChangedFiles: await count('SELECT COALESCE(SUM(files), 0) AS n FROM sessions WHERE user_id = ? AND updated_at > ?', userId, dayAgo),
+      // Home's "Files changed (24h)" (see stats.filesChanged24h); recentChangedFiles is the same value for older apps.
+      filesChanged24h: changed24h,
+      recentChangedFiles: changed24h,
       unreadNotifications: await count('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read_at IS NULL', userId),
     },
   });

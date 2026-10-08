@@ -73,6 +73,8 @@ const envSchema = z.object({
   REWARD_SIGNING_SECRET: z.string().optional(),
   // AdMob rewarded ad unit whose server-side verification callbacks grant Pro time (ad unit ids are public).
   ADMOB_REWARDED_UNIT: z.string().optional(),
+  // GitHub token (no scopes needed for public repos) for release lookups: 5,000 instead of 60 requests an hour. Never logged.
+  GITHUB_TOKEN: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -89,4 +91,4 @@ function parseEnv(): Env {
 export const env = parseEnv();
 
 
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';

@@ -28,9 +28,16 @@ const loopDelay = (() => {
   }
 })();
 
-export function recordRequest(status: number) {
+/**
+ * 5xx answers that are expected outcomes, not server faults: the PC is offline or slow, payments are not set
+ * up, or GitHub (release lookups) is unavailable before any release was cached. They are not alerted on and
+ * not counted as server errors.
+ */
+export const EXPECTED_SERVER_CODES = new Set(['DESKTOP_OFFLINE', 'DESKTOP_TIMEOUT', 'PAYMENTS_NOT_CONFIGURED', 'UPDATE_SOURCE_UNAVAILABLE']);
+
+export function recordRequest(status: number, expected = false) {
   requests++;
-  if (status >= 500) serverErrors++;
+  if (status >= 500 && !expected) serverErrors++;
   else if (status >= 400) clientErrors++;
 }
 

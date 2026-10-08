@@ -1,4 +1,4 @@
-import { recordServerError } from '../lib/monitor.js';
+import { EXPECTED_SERVER_CODES, recordServerError } from '../lib/monitor.js';
 import { ErrorHandler } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { ZodError } from 'zod';
@@ -23,9 +23,15 @@ export const errorHandler: ErrorHandler = (err, c) => {
 
   if (err instanceof HttpError) {
     if (err.status >= 500) {
-      logger.error(err.message, { requestId, code: err.code });
-      // Relay outcomes (PC offline/timeout) and unconfigured payments are expected, not server faults.
-      if (!['DESKTOP_OFFLINE', 'DESKTOP_TIMEOUT', 'PAYMENTS_NOT_CONFIGURED'].includes(err.code)) remember(c, err.status, err.code, err.message, requestId);
+      // Relay outcomes (PC offline/timeout), unconfigured payments and an unreachable release server are
+      // expected, not server faults: no alert, and not counted as server errors.
+      if (EXPECTED_SERVER_CODES.has(err.code)) {
+        (c as any).set('expectedError', true);
+        logger.warn(err.message, { requestId, code: err.code });
+      } else {
+        logger.error(err.message, { requestId, code: err.code });
+        remember(c, err.status, err.code, err.message, requestId);
+      }
     }
     return c.json({ error: { code: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) }, requestId }, err.status);
   }

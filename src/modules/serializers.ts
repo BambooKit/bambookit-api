@@ -14,6 +14,21 @@ const ACTIVE_SESSION_FOR_DEVICE = `
   WHERE s.device_id = ? ORDER BY CASE WHEN s.status IN ('busy','retry') THEN 0 ELSE 1 END, s.updated_at DESC LIMIT 1
 `;
 
+export type PcSettings = { approvalMode: 'ask' | 'edits' | 'all'; keepAwake: boolean; allowRemoteControl: boolean };
+
+/** Settings a PC reported (approval mode, keep awake, remote control), or null for desktops that never reported any. */
+export function deviceSettings(row: { kind?: string; settings?: string | null }): PcSettings | null {
+  if (row.kind !== 'desktop' || !row.settings) return null;
+  const s = parseJson<Partial<PcSettings> | null>(row.settings, null);
+  if (!s || typeof s !== 'object') return null;
+  return {
+    approvalMode: s.approvalMode === 'edits' || s.approvalMode === 'all' ? s.approvalMode : 'ask',
+    keepAwake: s.keepAwake === true,
+    // Remote terminal/power only ever run when the PC itself reports this true (turned on physically at the PC).
+    allowRemoteControl: s.allowRemoteControl === true,
+  };
+}
+
 export function isDeviceOnline(row: DeviceRow): boolean {
   if (row.revoked_at) return false;
   // A device is online while it holds a realtime stream; phones also count as online shortly after any request.
@@ -39,6 +54,8 @@ export async function serializeDevice(row: DeviceRow) {
     encryptionKey: row.kind === 'desktop' ? (row.encryption_key ?? null) : null,
     protocol: row.kind === 'desktop' ? (row.protocol ?? 1) : null,
     capabilities: row.kind === 'desktop' ? [...desktopCapabilities(row)].sort() : null,
+    // Desktops: { approvalMode: 'ask' | 'edits' | 'all', keepAwake } as last reported by the PC; null if never reported.
+    settings: deviceSettings(row),
     linkedDevices: links.map((l) => ({ id: l.id, name: l.name, kind: l.kind, platform: l.platform })),
     activeSession: active
       ? { id: active.id, title: active.title, status: active.status, projectName: active.project_name }
@@ -106,6 +123,8 @@ export function serializeApproval(row: any) {
     answers: row.answers ? parseJson<string[][]>(row.answers, []) : null,
     createdAt: row.created_at,
     resolvedAt: row.resolved_at,
+    // 'phone' | 'web' | 'pc' | 'auto' (approved by the PC's approval mode) | null (pending, expired or unknown).
+    resolvedBy: row.status === 'PENDING' || row.status === 'RESPONDING' ? null : (row.resolved_by ?? null),
   };
 }
 

@@ -35,3 +35,7 @@ services:
       # Rewarded ads: AdMob SSV callback URL https://<this service>/v1/rewards/admob-ssv
       - key: REWARD_SIGNING_SECRET
         sync: false
+      # Releases: optional GitHub token for GET /v1/releases/latest (public repos need no scopes; raises the
+      # rate limit from 60 to 5,000 req/h). The last good answer is cached and served stale on GitHub outages.
+      - key: GITHUB_TOKEN
+        sync: false

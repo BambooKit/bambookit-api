@@ -8,7 +8,7 @@ import { HttpError } from './http.js';
  * the capabilities of their app version (see LEGACY below), so nothing is ever sent to a PC that cannot
  * handle it — in particular, encrypted provider keys only go to PCs that publish an encryption key.
  */
-export const API_VERSION = '1.2.0';
+export const API_VERSION = '1.3.0';
 export const PROTOCOL_VERSION = 2;
 
 export type Capability =
@@ -30,7 +30,11 @@ export type Capability =
   | 'models'
   | 'create-session'
   | 'provider-keys.encrypted'
-  | 'session-stats';
+  | 'session-stats'
+  | 'approval-modes'
+  | 'keep-awake.remote'
+  | 'remote-terminal'
+  | 'remote-power';
 
 /** What each feature needs, and the first BambooKit Desktop release that has it. */
 export const REQUIREMENTS: Record<string, { capability: Capability; since: string; reason: string }> = {
@@ -42,6 +46,12 @@ export const REQUIREMENTS: Record<string, { capability: Capability; since: strin
   tree: { capability: 'relay.tree', since: '1.0.2', reason: 'Browsing project files needs the newer desktop.' },
   file: { capability: 'relay.file', since: '1.0.2', reason: 'Viewing project files needs the newer desktop.' },
   providerKeys: { capability: 'provider-keys.encrypted', since: '1.0.3', reason: 'Encrypted provider keys need the newer secure credential protocol.' },
+  // Reported by desktops that implement them (never implied by version: older desktops always report capabilities).
+  approvalMode: { capability: 'approval-modes', since: '1.0.8', reason: 'Changing the approval mode (Ask, Auto, Auto-approve) needs the newer desktop.' },
+  keepAwake: { capability: 'keep-awake.remote', since: '1.0.8', reason: 'Keeping the PC awake from a phone or the website needs the newer desktop.' },
+  // Developer tools (owner-only): remote terminal and power control of the owner's own paired PC.
+  remoteTerminal: { capability: 'remote-terminal', since: '1.3.0', reason: 'Opening a terminal on this PC from the phone needs the newer desktop.' },
+  remotePower: { capability: 'remote-power', since: '1.3.0', reason: 'Sleeping, shutting down or locking this PC from the phone needs the newer desktop.' },
 };
 
 /** Capabilities of desktops that registered before capability reporting existed, by app version. */

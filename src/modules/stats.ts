@@ -185,7 +185,8 @@ async function gather(userId: string) {
   );
   const agentRows = await db.all<{ agent: string }>('SELECT DISTINCT agent FROM sessions WHERE user_id = ? AND agent IS NOT NULL', userId);
   const approvalRows = await db.all<{ kind: string | null; status: string; n: number }>(
-    'SELECT kind, status, COUNT(*) AS n FROM approvals WHERE user_id = ? GROUP BY kind, status',
+    // Requests the PC approved by itself (approval mode) are not answers by the user.
+    "SELECT kind, status, COUNT(*) AS n FROM approvals WHERE user_id = ? AND (resolved_by IS NULL OR resolved_by <> 'auto') GROUP BY kind, status",
     userId,
   );
   const deviceRow = await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM devices WHERE user_id = ?', userId);
@@ -567,6 +568,34 @@ function achievementList(values: Record<string, number>, unlocked: Map<string, s
   return { items, summary: { unlocked: count, total: ACHIEVEMENTS.length, tiersUnlocked, tiersTotal: ACHIEVEMENTS.length * TIERS.length, points } };
 }
 
+/**
+ * "Files changed (24h)": distinct files changed in sessions (including sub-agent sessions) with real activity
+ * in the last 24 hours. Files are told apart by the one-way keys recorded from the PC's diffs, so a file
+ * changed in several sessions counts once; sessions without a recorded diff count their own total (the
+ * engine's changed-file count or the PC's statistics, whichever is larger).
+ */
+export async function filesChanged24h(userId: string, nowMs = Date.now()): Promise<number> {
+  const since = new Date(nowMs - 86_400_000).toISOString();
+  const keyed = await db.get<{ n: number }>(
+    `SELECT COUNT(DISTINCT f.file_key) AS n FROM session_files f JOIN sessions s ON s.id = f.session_id
+     WHERE s.user_id = ? AND s.activity_at >= ?`,
+    userId,
+    since,
+  );
+  const untracked = await db.all<{ files: number; stats: string | null }>(
+    `SELECT s.files, s.stats FROM sessions s
+     WHERE s.user_id = ? AND s.activity_at >= ? AND NOT EXISTS (SELECT 1 FROM session_files f WHERE f.session_id = s.id)`,
+    userId,
+    since,
+  );
+  let n = Number(keyed?.n ?? 0);
+  for (const s of untracked) {
+    const st = parseStats(s.stats);
+    n += Math.max(Number(s.files) || 0, num(st.filesCreated) + num(st.filesModified) + num(st.filesDeleted) + num(st.filesRenamed));
+  }
+  return n;
+}
+
 export const statsRouter = new Hono<AppEnv>();
 statsRouter.use('*', requireUser);
 
@@ -574,7 +603,7 @@ statsRouter.use('*', requireUser);
 statsRouter.get('/me/stats', async (c) => {
   const userId = c.get('user').id;
   const { stats, achievements, summary } = await refreshAchievements(userId);
-  return c.json({ data: { ...stats, achievements, achievementSummary: summary } });
+  return c.json({ data: { ...stats, filesChanged24h: await filesChanged24h(userId), achievements, achievementSummary: summary } });
 });
 
 // GET /v1/me/achievements — { data: [50 achievements with tiers], summary }

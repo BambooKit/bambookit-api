@@ -17,6 +17,7 @@ export interface DeviceRow {
   encryption_key?: string | null;
   protocol?: number | null;
   capabilities?: string | null;
+  settings?: string | null;
   push_token: string | null;
   last_seen_at: string | null;
   created_at: string;

@@ -383,6 +383,10 @@ async function migrate(d: Database) {
     PRIMARY KEY (user_id, achievement)
   )`);
   await d.run('ALTER TABLE devices ADD COLUMN capabilities TEXT').catch(() => undefined);
+  // Desktop settings the PC reports (JSON { approvalMode: 'ask'|'edits'|'all', keepAwake: boolean }); see modules/devices.ts.
+  await d.run('ALTER TABLE devices ADD COLUMN settings TEXT').catch(() => undefined);
+  // Who resolved an approval and when ('phone'|'web'|'pc'|'auto'); 'auto' = the PC approved it itself (Auto / Auto-approve mode).
+  await d.run('ALTER TABLE approvals ADD COLUMN resolved_by TEXT').catch(() => undefined);
   // Provider API keys set or removed on a PC (succeeded commands), for the Secure Actions achievement.
   await d.run('ALTER TABLE users ADD COLUMN key_changes INTEGER NOT NULL DEFAULT 0').catch(() => undefined);
   // Questions the agent asks (kind = 'question') travel through approvals with their options and answers.
@@ -444,6 +448,20 @@ async function migrate(d: Database) {
     PRIMARY KEY (user_id, day)
   )`);
   await d.run('CREATE INDEX IF NOT EXISTS user_active_days_day ON user_active_days(day)');
+  // API 1.3: approvals history paging, when a session last really changed (sync rewrites updated_at on every
+  // snapshot), and one-way hashes of the files each session changed so "Files changed (24h)" counts a file once
+  // across sessions (no paths stored).
+  await d.run('CREATE INDEX IF NOT EXISTS approvals_user_created ON approvals(user_id, created_at)');
+  await d.run('ALTER TABLE sessions ADD COLUMN activity_at TEXT').catch(() => undefined);
+  await d.run('UPDATE sessions SET activity_at = created_at WHERE activity_at IS NULL');
+  await d.run(`CREATE TABLE IF NOT EXISTS session_files (
+    session_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    file_key TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, file_key)
+  )`);
+  await d.run('CREATE INDEX IF NOT EXISTS session_files_user ON session_files(user_id)');
   // Session chats, diffs and activity now live only on the PC; remove copies stored by earlier versions.
   await d.run('DELETE FROM session_parts');
   await d.run('DELETE FROM session_diffs');

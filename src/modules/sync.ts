@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { db, now } from '../db/database.js';
+import { createHash } from 'node:crypto';
+import { db, now, type Queryable } from '../db/database.js';
 import { requireDevice, requireUser, type AppEnv } from '../middleware/auth.js';
 import { badRequest, stableId } from '../lib/http.js';
 import { logger } from '../lib/logger.js';
@@ -97,6 +98,9 @@ const syncSchema = z.object({
         // True once the user has continued this session on the PC; only then may phones chat in it.
         remote: z.boolean().default(false),
         createdAt: z.string().optional(),
+        // Optional (API 1.3): when the engine last changed the session (ISO time or epoch ms). Without it the API
+        // takes the time of the first sync that shows a change.
+        updatedAt: z.union([z.string().max(40), z.number().int().nonnegative()]).optional(),
         // Totals for the whole session computed by the PC from its own records (replaced on every sync).
         stats: sessionStatsSchema.optional(),
       }),
@@ -126,8 +130,12 @@ const syncSchema = z.object({
         permission: z.string().max(100),
         title: z.string().max(1000).nullish(),
         patterns: z.array(z.string().max(1000)).max(50).default([]),
-        status: z.enum(['PENDING', 'APPROVED', 'REJECTED']),
+        // ANSWERED and EXPIRED are accepted from API 1.3 (answered questions may also arrive as APPROVED).
+        status: z.enum(['PENDING', 'APPROVED', 'REJECTED', 'ANSWERED', 'EXPIRED']),
         reply: z.string().max(20).nullish(),
+        // Who resolved it on the PC side: 'auto' = approved by the PC's approval mode, 'pc' = answered on the PC.
+        // Missing for answers that came from a phone or the website (the API already knows those).
+        resolvedBy: z.enum(['phone', 'web', 'pc', 'auto']).nullish(),
         kind: z.enum(['permission', 'question']).default('permission'),
         questions: z
           .array(
@@ -165,6 +173,72 @@ const syncSchema = z.object({
 });
 
 export type SyncPayload = z.infer<typeof syncSchema>;
+type SessionSync = NonNullable<SyncPayload['sessions']>[number];
+type ApprovalSync = NonNullable<SyncPayload['approvals']>[number];
+
+/** Resolved approvals are listed (GET /v1/approvals?status=resolved|all) for this long. */
+export const APPROVAL_HISTORY_MS = 30 * 86_400_000;
+
+/**
+ * Who resolved a finished approval, as far as the PC tells. Without a word from the PC, an engine reply
+ * that no phone or website claimed came from the PC. Questions are never auto-answered.
+ */
+function resolverFor(a: ApprovalSync): string | null {
+  if (a.status === 'EXPIRED' || a.status === 'PENDING') return null;
+  if (a.resolvedBy === 'auto' && a.kind === 'question') return 'pc';
+  return a.resolvedBy ?? 'pc';
+}
+
+function toIso(value: string | number | undefined): string | null {
+  if (value === undefined) return null;
+  const ms = typeof value === 'number' ? value : Date.parse(value);
+  return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : null;
+}
+
+/**
+ * When a session last really changed. Every snapshot re-sends the PC's recent sessions, so updated_at only means
+ * "seen"; activity_at moves when the engine reports a newer update time, or (desktops that do not send updatedAt)
+ * when the session is working or its status, changes or statistics differ from what the API has.
+ */
+function sessionActivityAt(s: SessionSync, previous: any, ts: string): string {
+  const reported = toIso(s.updatedAt);
+  if (reported) {
+    const clamped = reported > ts ? ts : reported;
+    return previous?.activity_at && previous.activity_at > clamped ? previous.activity_at : clamped;
+  }
+  const working = s.status === 'busy' || s.status === 'retry';
+  if (!previous) return working ? ts : (toIso(s.createdAt) ?? ts);
+  const changed =
+    working ||
+    previous.status !== s.status ||
+    Number(previous.additions) !== s.additions ||
+    Number(previous.deletions) !== s.deletions ||
+    Number(previous.files) !== s.files ||
+    (!!s.stats && previous.stats !== JSON.stringify(s.stats));
+  return changed ? ts : (previous.activity_at ?? ts);
+}
+
+/**
+ * Remembers which files a session changed as one-way keys (PC + folder + path), so a file changed in several
+ * sessions counts once. Paths themselves are never stored. Each diff is the session's complete list.
+ */
+async function recordSessionFiles(q: Queryable, userId: string, sessionId: string, files: string[], ts: string) {
+  const session = await q.get<{ device_id: string; directory: string }>('SELECT device_id, directory FROM sessions WHERE id = ?', sessionId);
+  if (!session) return;
+  const keys = [...new Set(files.map((f) => fileKey(session.device_id, session.directory, f)))];
+  await q.run('DELETE FROM session_files WHERE session_id = ?', sessionId);
+  for (const key of keys) {
+    await q.run('INSERT INTO session_files (session_id, user_id, file_key, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (session_id, file_key) DO NOTHING', sessionId, userId, key, ts);
+  }
+}
+
+export function fileKey(deviceId: string, directory: string, file: string): string {
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '');
+  const path = norm(file);
+  // Absolute paths are used as they are; relative ones belong to the session's folder.
+  const full = /^([a-zA-Z]:)?\//.test(path) ? path : `${norm(directory)}/${path.replace(/^\.\//, '')}`;
+  return createHash('sha256').update(`${deviceId}\0${full.toLowerCase()}`).digest('hex').slice(0, 32);
+}
 export type PartSync = z.infer<typeof partSchema>;
 
 /** Shape clients receive for a chat part (same for live events and transcripts fetched from the PC). */
@@ -284,7 +358,8 @@ syncRouter.post('/', async (c) => {
       const id = sessionIdFor(s.opencodeSessionId);
       const projectId = s.opencodeProjectId ? projectIds.get(s.opencodeProjectId) ?? stableId('prj', device.id, s.opencodeProjectId) : null;
       const projectExists = projectId ? !!(await q.get('SELECT 1 AS ok FROM projects WHERE id = ?', projectId)) : false;
-      const previous = await q.get('SELECT status, title FROM sessions WHERE id = ?', id);
+      const previous = await q.get('SELECT status, title, additions, deletions, files, stats, activity_at FROM sessions WHERE id = ?', id);
+      const activityAt = sessionActivityAt(s, previous, ts);
       await q.run(
         `INSERT INTO sessions (id, user_id, device_id, project_id, opencode_session_id, parent_opencode_session_id, directory, title, status,
            status_message, agent, model, additions, deletions, files, current_action, remote, created_at, updated_at)
@@ -298,6 +373,7 @@ syncRouter.post('/', async (c) => {
         s.status, s.statusMessage ?? null, s.agent ?? null, s.model ?? null, s.additions, s.deletions, s.files, s.currentAction ?? null, s.remote ? 1 : 0, s.createdAt ?? ts, ts,
       );
       if (s.stats) await q.run('UPDATE sessions SET stats = ? WHERE id = ?', JSON.stringify(s.stats), id);
+      if (activityAt !== previous?.activity_at) await q.run('UPDATE sessions SET activity_at = ? WHERE id = ?', activityAt, id);
       await trackWork(q, { userId: user.id, sessionId: id, projectId: projectExists ? projectId : null, previous: previous?.status ?? null, status: s.status, parent: !!s.parentId, ts });
       const row = await q.get('SELECT s.*, p.name AS project_name FROM sessions s LEFT JOIN projects p ON p.id = s.project_id WHERE s.id = ?', id);
       out.push({ userId: user.id, deviceId: device.id, projectId: row.project_id, sessionId: id, type: 'session.updated', payload: serializeSession(row) });
@@ -318,6 +394,7 @@ syncRouter.post('/', async (c) => {
       if (!(await ownsSession(id))) continue;
       await q.run('DELETE FROM session_parts WHERE session_id = ?', id);
       await q.run('DELETE FROM session_diffs WHERE session_id = ?', id);
+      await q.run('DELETE FROM session_files WHERE session_id = ?', id);
       await q.run('DELETE FROM approvals WHERE session_id = ?', id);
       await q.run('UPDATE commands SET session_id = NULL WHERE session_id = ?', id);
       const res = await q.run('DELETE FROM sessions WHERE id = ?', id);
@@ -340,6 +417,7 @@ syncRouter.post('/', async (c) => {
       const sessionId = sessionIdFor(d.opencodeSessionId);
       if (!(await ownsSession(sessionId))) continue;
       live.push({ userId: user.id, deviceId: device.id, sessionId, type: 'session.diff', payload: { sessionId, files: d.files } });
+      await recordSessionFiles(q, user.id, sessionId, d.files.map((f) => f.file), ts);
     }
 
     for (const a of body.approvals ?? []) {
@@ -349,10 +427,11 @@ syncRouter.post('/', async (c) => {
       const existing = await q.get('SELECT status FROM approvals WHERE id = ?', id);
       if (!existing) {
         await q.run(
-          `INSERT INTO approvals (id, user_id, device_id, session_id, opencode_request_id, permission, title, patterns, status, reply, kind, questions, answers, created_at, resolved_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO approvals (id, user_id, device_id, session_id, opencode_request_id, permission, title, patterns, status, reply, kind, questions, answers, created_at, resolved_at, resolved_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           id, user.id, device.id, sessionId, a.requestId, a.permission, a.title ?? null, JSON.stringify(a.patterns), a.status, a.reply ?? null,
           a.kind, a.questions ? JSON.stringify(a.questions) : null, a.answers ? JSON.stringify(a.answers) : null, ts, a.status === 'PENDING' ? null : ts,
+          a.status === 'PENDING' ? null : resolverFor(a),
         );
         if (a.status === 'PENDING') {
           notes.push(
@@ -362,7 +441,11 @@ syncRouter.post('/', async (c) => {
           );
         }
       } else if (a.status !== 'PENDING') {
-        await q.run('UPDATE approvals SET status = ?, reply = ?, answers = COALESCE(?, answers), resolved_at = ? WHERE id = ?', a.status, a.reply ?? null, a.answers ? JSON.stringify(a.answers) : null, ts, id);
+        // A phone/web answer was recorded when it was claimed; the PC's own word wins when it gives one.
+        await q.run(
+          "UPDATE approvals SET status = ?, reply = ?, answers = COALESCE(?, answers), resolved_at = COALESCE(resolved_at, ?), resolved_by = CASE WHEN ? = 'EXPIRED' THEN NULL ELSE COALESCE(?, resolved_by, ?) END WHERE id = ?",
+          a.status, a.reply ?? null, a.answers ? JSON.stringify(a.answers) : null, ts, a.status, a.resolvedBy ? resolverFor(a) : null, resolverFor(a), id,
+        );
       } else {
         continue;
       }
@@ -374,7 +457,7 @@ syncRouter.post('/', async (c) => {
       const pending = await q.all("SELECT id, opencode_request_id, session_id FROM approvals WHERE device_id = ? AND status IN ('PENDING','RESPONDING')", device.id);
       for (const p of pending) {
         if (keep.has(p.opencode_request_id)) continue;
-        await q.run("UPDATE approvals SET status = 'EXPIRED', resolved_at = ? WHERE id = ?", ts, p.id);
+        await q.run("UPDATE approvals SET status = 'EXPIRED', resolved_at = ?, resolved_by = NULL WHERE id = ?", ts, p.id);
         out.push({ userId: user.id, deviceId: device.id, sessionId: p.session_id, type: 'approval.updated', payload: serializeApproval(await approvalRow(p.id)) });
       }
     }
@@ -391,6 +474,10 @@ syncRouter.post('/', async (c) => {
     }
   });
 
+  // Requests the PC approved by itself are history only: keep them for 30 days.
+  if (body.approvals?.some((a) => a.resolvedBy === 'auto')) {
+    await db.run("DELETE FROM approvals WHERE user_id = ? AND resolved_by = 'auto' AND resolved_at < ?", user.id, new Date(Date.now() - APPROVAL_HISTORY_MS).toISOString());
+  }
   for (const e of out) await publish(e);
   for (const e of live) emitEphemeral(e);
   for (const n of notes) await notify(n);
