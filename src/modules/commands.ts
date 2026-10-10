@@ -78,6 +78,9 @@ export async function createCommand(input: {
   issuer: DeviceRow | null;
   type: CommandType;
   payload: unknown;
+  /** Whose daily plan allowance this counts against (defaults to userId). For a collaborator's SEND_MESSAGE
+   *  the command targets the owner's PC (userId = owner) but the quota is the collaborator's own. */
+  quotaUserId?: string;
 }) {
   const desktop = input.desktop;
   if (!desktop || desktop.user_id !== input.userId || desktop.kind !== 'desktop') throw notFound('Device');
@@ -90,8 +93,9 @@ export async function createCommand(input: {
   // Plan limits: chatting and starting sessions from a phone or the website count toward the daily
   // allowance (desktops do not). Approvals, answers, continue-on-PC, renames and keys are never limited.
   if (input.issuer?.kind !== 'desktop') {
-    if (input.type === 'SEND_MESSAGE') await consumeDailyQuota(input.userId, 'messages');
-    else if (input.type === 'CREATE_SESSION') await consumeDailyQuota(input.userId, 'sessions');
+    const quotaUserId = input.quotaUserId ?? input.userId;
+    if (input.type === 'SEND_MESSAGE') await consumeDailyQuota(quotaUserId, 'messages');
+    else if (input.type === 'CREATE_SESSION') await consumeDailyQuota(quotaUserId, 'sessions');
   }
   const id = newId('cmd');
   const ts = now();

@@ -2275,3 +2275,206 @@ describe('API 1.3: developer tools (owner-only remote power and terminal)', () =
     expect((await call('POST', `/v1/devices/${pc.id}/terminal`, { token: other, deviceId: pc.id, keys: pc.keys, body: { termId: 'term-1', data: 'x' } })).status).toBe(403);
   });
 });
+
+describe('clone import: GET /v1/shares/:id/import-preview', () => {
+  async function shareWith(items: Array<{ type: string; data: any }>) {
+    const created = await call('POST', '/api/share', { body: { sessionID: 'ses_import_src' } });
+    expect(created.status).toBe(200);
+    const { id, secret } = created.json;
+    expect((await call('POST', `/api/share/${id}/sync`, { body: { secret, data: items } })).status).toBe(200);
+    return id as string;
+  }
+
+  it('extracts a safe seed: seedPrompt, context (prompts + assistant text + tool titles, no file contents), model, counts', async () => {
+    const token = await tokenFor('user-imp-1', 'imp1@example.com');
+    const id = await shareWith([
+      { type: 'session', data: { id: 'ses_import_src', title: 'Fix login', directory: 'C:/work/myapp' } },
+      { type: 'message', data: { id: 'm1', role: 'user', time: { created: 1 } } },
+      { type: 'message', data: { id: 'm2', role: 'assistant', providerID: 'anthropic', modelID: 'claude-x', time: { created: 2 } } },
+      { type: 'message', data: { id: 'm3', role: 'user', time: { created: 3 } } },
+      { type: 'part', data: { id: 'p1', messageID: 'm1', type: 'text', text: 'Please fix the login bug' } },
+      { type: 'part', data: { id: 'p2', messageID: 'm2', type: 'text', text: 'I will look into it' } },
+      { type: 'part', data: { id: 'p3', messageID: 'm2', type: 'tool', tool: 'read', state: { title: 'src/login.ts', status: 'completed', input: { filePath: 'src/login.ts' }, output: 'TOP_SECRET_FILE_CONTENTS_do_not_leak' } } },
+      { type: 'part', data: { id: 'p4', messageID: 'm3', type: 'text', text: 'Thanks!' } },
+    ]);
+
+    const res = await call('GET', `/v1/shares/${id}/import-preview`, { token });
+    expect(res.status).toBe(200);
+    const p = res.json.data;
+    expect(p.title).toBe('Fix login');
+    expect(p.projectName).toBe('myapp');
+    expect(p.model).toEqual({ providerID: 'anthropic', modelID: 'claude-x' });
+    expect(p.promptCount).toBe(2);
+    expect(p.seedPrompt).toBe('Please fix the login bug');
+    expect(p.context).toContain('User: Please fix the login bug');
+    expect(p.context).toContain('Assistant: I will look into it');
+    expect(p.context).toContain('Assistant used read: src/login.ts');
+    expect(p.context).toContain('User: Thanks!');
+    // Raw file contents / tool output never appear in the seed.
+    expect(p.context).not.toContain('TOP_SECRET_FILE_CONTENTS_do_not_leak');
+  });
+
+  it('clamps the context to ~8000 chars, requires sign-in, and 404s a missing share', async () => {
+    const token = await tokenFor('user-imp-2', 'imp2@example.com');
+    const big = 'x'.repeat(20000);
+    const id = await shareWith([
+      { type: 'session', data: { id: 'ses_import_src', title: 'Big', directory: 'C:/work/big' } },
+      { type: 'message', data: { id: 'm1', role: 'user', time: { created: 1 } } },
+      { type: 'part', data: { id: 'p1', messageID: 'm1', type: 'text', text: big } },
+    ]);
+    const res = await call('GET', `/v1/shares/${id}/import-preview`, { token });
+    expect(res.status).toBe(200);
+    expect(res.json.data.context.length).toBeLessThanOrEqual(8000);
+
+    expect((await call('GET', `/v1/shares/${id}/import-preview`)).status).toBe(401);
+    expect((await call('GET', '/v1/shares/does-not-exist/import-preview', { token })).status).toBe(404);
+  });
+});
+
+describe('session collaborators', () => {
+  const ownerSub = 'user-collab-owner';
+
+  // Sets up an owner with a continued (remote) session on a PC, plus a pending approval on it.
+  async function setupOwnerSession() {
+    const token = await tokenFor(ownerSub, 'owner.c@example.com');
+    const desktop = await setupDesktop(token);
+    await call('POST', '/v1/sync', {
+      token,
+      deviceId: desktop.id,
+      keys: desktop.keys,
+      body: {
+        projects: [{ opencodeProjectId: 'p_col', name: 'colproj', directory: 'C:/work/col' }],
+        sessions: [{ opencodeSessionId: 'ses_col', opencodeProjectId: 'p_col', directory: 'C:/work/col', title: 'Collab session', status: 'idle', remote: true }],
+        approvals: [{ opencodeSessionId: 'ses_col', requestId: 'req_col', permission: 'bash', title: 'npm test', patterns: ['npm test'], status: 'PENDING' }],
+      },
+    });
+    const session = (await call('GET', '/v1/sessions', { token })).json.data[0];
+    const approval = (await call('GET', '/v1/approvals', { token })).json.data[0];
+    return { token, desktop, session, approvalId: approval.id as string };
+  }
+
+  it('lets the owner add/list/remove collaborators, links by email, and tags role + pending', async () => {
+    const { token, session } = await setupOwnerSession();
+    const chatToken = await tokenFor('user-collab-chat', 'chat.c@example.com');
+    await call('GET', '/v1/me', { token: chatToken }); // existing account before invite links immediately
+
+    const add = await call('POST', `/v1/sessions/${session.id}/collaborators`, { token, body: { email: 'chat.c@example.com', role: 'chat' } });
+    expect(add.status).toBe(201);
+    const chat = add.json.data.collaborators.find((x: any) => x.email === 'chat.c@example.com');
+    expect(chat).toMatchObject({ userId: 'user-collab-chat', role: 'chat', pending: false });
+    expect(add.json.data.owner).toMatchObject({ userId: ownerSub, email: 'owner.c@example.com' });
+
+    // Pending-by-email: no account yet.
+    const pend = await call('POST', `/v1/sessions/${session.id}/collaborators`, { token, body: { email: 'pending.c@example.com', role: 'viewer' } });
+    expect(pend.status).toBe(201);
+    const pendingRow = pend.json.data.collaborators.find((x: any) => x.email === 'pending.c@example.com');
+    expect(pendingRow).toMatchObject({ userId: null, pending: true, role: 'viewer' });
+
+    // It links when that user signs in.
+    const pendingToken = await tokenFor('user-collab-pending', 'pending.c@example.com');
+    await call('GET', '/v1/me', { token: pendingToken });
+    const listed = await call('GET', `/v1/sessions/${session.id}/collaborators`, { token });
+    expect(listed.json.data.collaborators.find((x: any) => x.email === 'pending.c@example.com')).toMatchObject({ userId: 'user-collab-pending', pending: false });
+
+    // Cannot invite the owner; email is validated.
+    expect((await call('POST', `/v1/sessions/${session.id}/collaborators`, { token, body: { email: 'owner.c@example.com', role: 'chat' } })).status).toBe(400);
+    expect((await call('POST', `/v1/sessions/${session.id}/collaborators`, { token, body: { email: 'not-an-email', role: 'chat' } })).status).toBe(400);
+
+    // DELETE by userId and by email both work.
+    expect((await call('DELETE', `/v1/sessions/${session.id}/collaborators/user-collab-chat`, { token })).status).toBe(200);
+    expect((await call('DELETE', `/v1/sessions/${session.id}/collaborators/${encodeURIComponent('pending.c@example.com')}`, { token })).status).toBe(200);
+    expect((await call('GET', `/v1/sessions/${session.id}/collaborators`, { token })).json.data.collaborators).toHaveLength(0);
+  });
+
+  it('gives a chat collaborator read + send, denies owner-only actions, and shows the session in their list', async () => {
+    const { token, desktop, session, approvalId } = await setupOwnerSession();
+    const chatToken = await tokenFor('user-collab-chat2', 'chat2.c@example.com');
+    await call('GET', '/v1/me', { token: chatToken });
+    expect((await call('POST', `/v1/sessions/${session.id}/collaborators`, { token, body: { email: 'chat2.c@example.com', role: 'chat' } })).status).toBe(201);
+
+    // Reads the session (role + owner), the collaborator list, and the transcript (relayed from the owner's PC).
+    const got = await call('GET', `/v1/sessions/${session.id}`, { token: chatToken });
+    expect(got.status).toBe(200);
+    expect(got.json.data.role).toBe('chat');
+    expect(got.json.data.owner.userId).toBe(ownerSub);
+    expect(got.json.data.collaboratorCount).toBe(1);
+    expect((await call('GET', `/v1/sessions/${session.id}/collaborators`, { token: chatToken })).json.data.collaborators.find((x: any) => x.you)).toMatchObject({ userId: 'user-collab-chat2' });
+
+    const stop = await serveDesktop(token, desktop, (kind) => (kind === 'transcript' ? { parts: [{ opencodeSessionId: 'ses_col', messageId: 'm1', partId: 'p1', role: 'user', type: 'text', text: 'hi', sortKey: '0001' }] } : {}));
+    const parts = await call('GET', `/v1/sessions/${session.id}/parts`, { token: chatToken });
+    stop();
+    expect(parts.status).toBe(200);
+    expect(parts.json.data).toHaveLength(1);
+
+    // Can SEND_MESSAGE (session is continued on the PC).
+    expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token: chatToken, body: { type: 'SEND_MESSAGE', payload: { text: 'from the collaborator' } } })).status).toBe(202);
+
+    // Denied (403 NOT_ALLOWED) for owner-only actions.
+    const denied403 = async (res: { status: number; json: any }) => {
+      expect(res.status).toBe(403);
+      expect(res.json.error.code).toBe('NOT_ALLOWED');
+    };
+    await denied403(await call('POST', `/v1/approvals/${approvalId}/respond`, { token: chatToken, body: { reply: 'once' } }));
+    await denied403(await call('POST', `/v1/sessions/${session.id}/commands`, { token: chatToken, body: { type: 'RENAME_SESSION', payload: { title: 'nope' } } }));
+    await denied403(await call('POST', `/v1/sessions/${session.id}/commands`, { token: chatToken, body: { type: 'ABORT', payload: {} } }));
+    await denied403(await call('POST', `/v1/devices/${desktop.id}/commands`, { token: chatToken, body: { type: 'SET_APPROVAL_MODE', payload: { mode: 'all' } } }));
+    await denied403(await call('POST', `/v1/devices/${desktop.id}/commands`, { token: chatToken, body: { type: 'POWER', payload: {} } }));
+    await denied403(await call('POST', `/v1/devices/${desktop.id}/commands`, { token: chatToken, body: { type: 'TERMINAL_OPEN', payload: { cols: 80, rows: 24 } } }));
+    await denied403(await call('POST', `/v1/devices/${desktop.id}/commands`, { token: chatToken, body: { type: 'SET_KEEP_AWAKE', payload: { on: true } } }));
+    await denied403(await call('POST', `/v1/devices/${desktop.id}/commands`, { token: chatToken, body: { type: 'SET_PROVIDER_KEY', payload: { providerID: 'anthropic', envelope: { alg: 'RSA-OAEP-256+A256GCM', key: 'x'.repeat(20), iv: 'x'.repeat(10), data: 'x'.repeat(10) } } } }));
+    await denied403(await call('POST', `/v1/sessions/${session.id}/collaborators`, { token: chatToken, body: { email: 'x.c@example.com', role: 'chat' } }));
+
+    // The collaborated session shows up in the collaborator's own session list, tagged with the role.
+    const list = (await call('GET', '/v1/sessions', { token: chatToken })).json.data;
+    expect(list.find((s: any) => s.id === session.id)).toMatchObject({ role: 'chat', owner: { userId: ownerSub } });
+  });
+
+  it('refuses sends from a viewer and from a non-collaborator (404), and charges the collaborator plan', async () => {
+    const { token, session } = await setupOwnerSession();
+    const viewerToken = await tokenFor('user-collab-viewer', 'viewer.c@example.com');
+    const strangerToken = await tokenFor('user-collab-stranger', 'stranger.c@example.com');
+    await call('GET', '/v1/me', { token: viewerToken });
+    expect((await call('POST', `/v1/sessions/${session.id}/collaborators`, { token, body: { email: 'viewer.c@example.com', role: 'viewer' } })).status).toBe(201);
+
+    // Viewer: read yes, send no (403 NOT_ALLOWED).
+    expect((await call('GET', `/v1/sessions/${session.id}`, { token: viewerToken })).json.data.role).toBe('viewer');
+    const vsend = await call('POST', `/v1/sessions/${session.id}/commands`, { token: viewerToken, body: { type: 'SEND_MESSAGE', payload: { text: 'hi' } } });
+    expect(vsend.status).toBe(403);
+    expect(vsend.json.error.code).toBe('NOT_ALLOWED');
+
+    // Non-collaborator: 404 everywhere (existence is not revealed).
+    expect((await call('GET', `/v1/sessions/${session.id}`, { token: strangerToken })).status).toBe(404);
+    expect((await call('GET', `/v1/sessions/${session.id}/collaborators`, { token: strangerToken })).status).toBe(404);
+    expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token: strangerToken, body: { type: 'SEND_MESSAGE', payload: { text: 'hi' } } })).status).toBe(404);
+
+    // A chat collaborator's SEND_MESSAGE counts against their OWN daily allowance, not the owner's.
+    const chatToken = await tokenFor('user-collab-plan', 'plan.c@example.com');
+    await call('GET', '/v1/me', { token: chatToken });
+    expect((await call('POST', `/v1/sessions/${session.id}/collaborators`, { token, body: { email: 'plan.c@example.com', role: 'chat' } })).status).toBe(201);
+    expect((await call('POST', `/v1/sessions/${session.id}/commands`, { token: chatToken, body: { type: 'SEND_MESSAGE', payload: { text: 'one' } } })).status).toBe(202);
+    expect((await call('GET', '/v1/me/plan', { token: chatToken })).json.data.usage.phoneMessagesToday).toBe(1);
+    expect((await call('GET', '/v1/me/plan', { token })).json.data.usage.phoneMessagesToday).toBe(0);
+  });
+
+  it('emits collaborators.updated to the owner and collaborators, and lets a collaborator leave', async () => {
+    const { token, session } = await setupOwnerSession();
+    const chatToken = await tokenFor('user-collab-leave', 'leave.c@example.com');
+    await call('GET', '/v1/me', { token: chatToken });
+
+    const bus = await import('../src/realtime/bus.js');
+    const ownerEvents: any[] = [];
+    const offOwner = bus.subscribe(ownerSub, (e) => { if (e.type === 'collaborators.updated') ownerEvents.push(e); });
+    expect((await call('POST', `/v1/sessions/${session.id}/collaborators`, { token, body: { email: 'leave.c@example.com', role: 'chat' } })).status).toBe(201);
+    expect(ownerEvents.length).toBeGreaterThanOrEqual(1);
+    expect(ownerEvents[0].payload.collaborators.some((x: any) => x.email === 'leave.c@example.com')).toBe(true);
+
+    // A collaborator can remove themselves (by their own userId).
+    const collabEvents: any[] = [];
+    const offCollab = bus.subscribe('user-collab-leave', (e) => { if (e.type === 'collaborators.updated') collabEvents.push(e); });
+    expect((await call('DELETE', `/v1/sessions/${session.id}/collaborators/user-collab-leave`, { token: chatToken })).status).toBe(200);
+    offOwner();
+    offCollab();
+    expect(collabEvents.length).toBeGreaterThanOrEqual(1);
+    expect((await call('GET', `/v1/sessions/${session.id}/collaborators`, { token })).json.data.collaborators).toHaveLength(0);
+  });
+});

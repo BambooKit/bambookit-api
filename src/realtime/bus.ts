@@ -18,6 +18,31 @@ export interface BambooEvent {
 const emitter = new EventEmitter();
 emitter.setMaxListeners(0);
 
+/**
+ * Session-content events that are also fanned out to a session's linked collaborators, so a collaborator's
+ * live stream receives updates for sessions they are on (not only the owner's stream). Live delivery only:
+ * stored events are kept under the owner's user id, so a collaborator who reconnects with ?after=<seq>
+ * replays only their own events — collaborators refetch session content from the PC (/parts, /history).
+ */
+const COLLAB_FANOUT_TYPES = new Set(['session.updated', 'session.part', 'session.transcript', 'session.diff', 'session.todos', 'session.removed', 'activity', 'session.message']);
+
+async function collaboratorUserIds(sessionId: string): Promise<string[]> {
+  try {
+    const rows = await db.all<{ user_id: string }>('SELECT DISTINCT user_id FROM session_collaborators WHERE session_id = ? AND user_id IS NOT NULL', sessionId);
+    return rows.map((r) => r.user_id);
+  } catch {
+    return [];
+  }
+}
+
+/** Deliver a session-content event to every linked collaborator's live stream (never the owner, already emitted). */
+async function fanOutToCollaborators(event: BambooEvent): Promise<void> {
+  if (!event.sessionId || !COLLAB_FANOUT_TYPES.has(event.type)) return;
+  for (const id of await collaboratorUserIds(event.sessionId)) {
+    if (id !== event.userId) emitter.emit(`user:${id}`, event);
+  }
+}
+
 const INSERT_EVENT = `
   INSERT INTO events (id, user_id, device_id, project_id, session_id, type, payload, created_at)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq
@@ -61,6 +86,7 @@ export async function publish(input: {
     payload: input.payload ?? {},
   };
   emitter.emit(`user:${input.userId}`, event);
+  await fanOutToCollaborators(event);
 
   if (++publishedSincePrune >= 500) {
     publishedSincePrune = 0;
@@ -94,6 +120,8 @@ export function emitEphemeral(input: {
     payload: input.payload ?? {},
   };
   emitter.emit(`user:${input.userId}`, event);
+  // Live fan-out to collaborators happens on the next tick so emitEphemeral stays synchronous for its callers.
+  void fanOutToCollaborators(event);
   return event;
 }
 

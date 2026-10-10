@@ -129,6 +129,26 @@ async function ownedDevice(userId: string, id: string): Promise<DeviceRow> {
   return row;
 }
 
+/**
+ * The target PC for a device-channel command. Controlling the PC (provider keys, approval mode, keep-awake,
+ * power/terminal) is owner-only. A collaborator on a session that runs on this PC gets an explicit
+ * 403 NOT_ALLOWED; anyone else gets 404 so the device's existence is not revealed.
+ */
+async function deviceForCommand(userId: string, id: string): Promise<DeviceRow> {
+  const row = await getDevice(id);
+  if (!row) throw notFound('Device');
+  if (row.user_id !== userId) {
+    const collab = await db.get(
+      'SELECT 1 AS ok FROM session_collaborators sc JOIN sessions s ON s.id = sc.session_id WHERE s.device_id = ? AND sc.user_id = ?',
+      id,
+      userId,
+    );
+    if (collab) throw forbidden('Collaborators cannot control the PC', 'NOT_ALLOWED');
+    throw notFound('Device');
+  }
+  return row;
+}
+
 // GET /v1/devices/:id
 devicesRouter.get('/:id', async (c) => {
   return c.json({ data: await serializeDevice(await ownedDevice(c.get('user').id, c.req.param('id'))) });
@@ -188,7 +208,7 @@ const TERMINAL_COMMANDS = new Set(['TERMINAL_OPEN', 'TERMINAL_INPUT', 'TERMINAL_
 // POST /v1/devices/:id/commands { type, payload } — from a paired phone or the website
 devicesRouter.post('/:id/commands', async (c) => {
   const user = c.get('user');
-  const desktop = await ownedDevice(user.id, c.req.param('id'));
+  const desktop = await deviceForCommand(user.id, c.req.param('id'));
   if (desktop.kind !== 'desktop') throw badRequest('Commands go to a PC');
   const body = z.object({ type: z.enum(deviceCommandTypes), payload: z.unknown().optional() }).parse(await c.req.json());
   // Never send encrypted credentials to a PC that cannot read them.

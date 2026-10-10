@@ -11,6 +11,7 @@ import { SIGNED_URL_SECONDS, keys, storage } from '../services/storage.js';
 import { relay } from './relay.js';
 import { serializeApproval } from './serializers.js';
 import { requireStorage } from './profile.js';
+import { assertSessionAccess } from './collaborators.js';
 
 /**
  * Session history: prompts, timeline, changed files with per-edit patches, tests and summary.
@@ -44,12 +45,12 @@ async function approvalsFor(sessionId: string) {
 // GET /v1/sessions/:id/history
 historyRouter.get('/:id/history', async (c) => {
   const user = c.get('user');
-  const session = await ownedSession(user.id, c.req.param('id'));
+  const { session } = await assertSessionAccess(user.id, c.req.param('id'), 'read');
   const desktop = await db.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', session.device_id);
   const approvals = await approvalsFor(session.id);
 
   if (desktop && !desktop.revoked_at && isConnected(desktop.id)) {
-    const history = (await relay(user.id, desktop, 'history', { opencodeSessionId: session.opencode_session_id })) as Record<string, unknown>;
+    const history = (await relay(session.user_id, desktop, 'history', { opencodeSessionId: session.opencode_session_id })) as Record<string, unknown>;
     return c.json({ data: { source: 'pc', savedAt: null, history: { ...history, sessionId: session.id }, approvals } });
   }
 
@@ -70,11 +71,11 @@ historyRouter.get('/:id/history', async (c) => {
 // GET /v1/sessions/:id/file-versions?path= — before/after of one file, live from the PC only
 historyRouter.get('/:id/file-versions', async (c) => {
   const user = c.get('user');
-  const session = await ownedSession(user.id, c.req.param('id'));
+  const { session } = await assertSessionAccess(user.id, c.req.param('id'), 'read');
   const path = z.string().min(1).max(1000).parse(c.req.query('path'));
   const desktop = await db.get<DeviceRow>('SELECT * FROM devices WHERE id = ?', session.device_id);
   if (!desktop || desktop.revoked_at) throw notFound('Device');
-  return c.json({ data: await relay(user.id, desktop, 'fileversions', { opencodeSessionId: session.opencode_session_id, path }) });
+  return c.json({ data: await relay(session.user_id, desktop, 'fileversions', { opencodeSessionId: session.opencode_session_id, path }) });
 });
 
 // POST /v1/sessions/:id/snapshot-upload { size } (signed, from the session's PC) → signed PUT URL for the gzip JSON copy

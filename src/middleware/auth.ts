@@ -5,6 +5,7 @@ import { verifySupabaseToken, type AuthUser } from '../auth/supabase.js';
 import { db, now } from '../db/database.js';
 import { forbidden, sha256, unauthorized } from '../lib/http.js';
 import { recordActiveDay } from '../lib/activity.js';
+import { linkPendingCollaborators } from '../modules/collaborators.js';
 
 export interface DeviceRow {
   id: string;
@@ -67,6 +68,8 @@ export const requireUser = createMiddleware<AppEnv>(async (c, next) => {
     await db.run(UPSERT_USER, user.id, user.email, user.name, user.avatarUrl, user.provider, verified, ts, ts);
     lastUpsert.set(user.id, Date.now());
     if (isNew) onNewUser?.({ email: user.email, provider: user.provider });
+    // Link any session invitations sent to this email before the account existed (pending-by-email).
+    await linkPendingCollaborators(user.id, user.email, ts);
     await recordActiveDay(user.id);
   }
   c.set('user', user);

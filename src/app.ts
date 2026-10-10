@@ -15,7 +15,7 @@ import { approvalsRouter } from './modules/approvals.js';
 import { notificationsRouter } from './modules/notifications.js';
 import { syncRouter } from './modules/sync.js';
 import { realtimeRouter } from './modules/realtime.js';
-import { sharesRouter } from './modules/shares.js';
+import { sharesRouter, shareImportRouter } from './modules/shares.js';
 import { relayRouter } from './modules/relay.js';
 import { API_VERSION, PROTOCOL_VERSION } from './lib/compat.js';
 import { statsRouter } from './modules/stats.js';
@@ -66,6 +66,7 @@ v1.route('/', statsRouter); // /me/stats, /me/achievements, PATCH /projects/:id
 v1.route('/devices', devicesRouter);
 v1.route('/pairing', pairingRouter);
 v1.route('/projects', projectsRouter);
+v1.route('/shares', shareImportRouter); // /:id/import-preview — clone a shared session (auth required)
 v1.route('/sessions', historyRouter); // /:id/history, /:id/file-versions, /:id/snapshot-upload
 v1.route('/sessions', sessionsRouter);
 v1.route('/commands', commandsRouter);

@@ -8,6 +8,7 @@ import { createCommand, resolveIssuer } from './commands.js';
 import { serializeApproval } from './serializers.js';
 import { relay } from './relay.js';
 import { APPROVAL_HISTORY_MS } from './sync.js';
+import { assertSessionAccess } from './collaborators.js';
 
 export const approvalsRouter = new Hono<AppEnv>();
 approvalsRouter.use('*', requireUser);
@@ -102,8 +103,10 @@ async function forward(c: any, reply: string, command: { type: 'PERMISSION_REPLY
 }
 
 async function ownedApproval(c: any) {
-  const approval = await db.get(`${APPROVAL_SELECT} WHERE a.id = ? AND a.user_id = ?`, c.req.param('id'), c.get('user').id);
+  const approval = await db.get(`${APPROVAL_SELECT} WHERE a.id = ?`, c.req.param('id'));
   if (!approval) throw notFound('Approval');
+  // Answering an approval is owner-only: a collaborator on the session gets 403 NOT_ALLOWED, a stranger 404.
+  await assertSessionAccess(c.get('user').id, approval.session_id, 'owner');
   return approval;
 }
 

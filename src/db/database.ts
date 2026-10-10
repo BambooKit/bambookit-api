@@ -462,6 +462,23 @@ async function migrate(d: Database) {
     PRIMARY KEY (session_id, file_key)
   )`);
   await d.run('CREATE INDEX IF NOT EXISTS session_files_user ON session_files(user_id)');
+  // Collaborators invited to one session (separate from the public read-only share link). user_id is linked
+  // when the invited email matches an existing account, otherwise it stays pending and is linked on that
+  // user's next sign-in. role: 'chat' (view + send messages) or 'viewer' (view only).
+  await d.run(`CREATE TABLE IF NOT EXISTS session_collaborators (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    user_id TEXT,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('chat','viewer')),
+    invited_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    accepted_at TEXT,
+    UNIQUE (session_id, email)
+  )`);
+  await d.run('CREATE INDEX IF NOT EXISTS session_collaborators_session ON session_collaborators(session_id)');
+  await d.run('CREATE INDEX IF NOT EXISTS session_collaborators_user ON session_collaborators(user_id)');
+  await d.run('CREATE INDEX IF NOT EXISTS session_collaborators_email ON session_collaborators(email)');
   // Session chats, diffs and activity now live only on the PC; remove copies stored by earlier versions.
   await d.run('DELETE FROM session_parts');
   await d.run('DELETE FROM session_diffs');

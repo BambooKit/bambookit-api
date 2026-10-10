@@ -5,6 +5,7 @@ import { env } from '../config/env.js';
 import { db, now } from '../db/database.js';
 import { HttpError, notFound, sha256 } from '../lib/http.js';
 import { renderSharePage } from './share-page.js';
+import { requireUser, type AppEnv } from '../middleware/auth.js';
 
 /**
  * Public session sharing ("Publish on web") for BambooKit Desktop.
@@ -125,4 +126,81 @@ sharesRouter.get('/share/:id', async (c) => {
   c.header('Cache-Control', 'no-store');
   c.header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'");
   return c.html(renderSharePage(share, await shareItems(id)));
+});
+
+// ---------------- "Open in my BambooKit": clone a shared session into the opener's account ----------------
+
+const IMPORT_CONTEXT_MAX = 8000;
+const IMPORT_LIMIT_PER_MIN = 30;
+const importByUser = new Map<string, number[]>();
+function importRateLimit(userId: string) {
+  const minuteAgo = Date.now() - 60_000;
+  const recent = (importByUser.get(userId) ?? []).filter((t) => t > minuteAgo);
+  if (recent.length >= IMPORT_LIMIT_PER_MIN) throw new HttpError(429, 'RATE_LIMITED', 'Too many import previews; try again shortly');
+  recent.push(Date.now());
+  importByUser.set(userId, recent);
+  if (importByUser.size > 10_000) importByUser.clear();
+}
+
+const isText = (p: any) => p?.type === 'text' && !p?.synthetic && !p?.ignored && typeof p?.text === 'string' && p.text.trim();
+const toolTitle = (p: any) => p?.state?.title || p?.state?.input?.command || p?.state?.input?.filePath || '';
+
+/**
+ * Builds a safe, compact seed for cloning a shared session: title, project name, model, prompt count, the
+ * first user prompt, and a plain-text transcript of user prompts + assistant text + tool titles (NO raw file
+ * contents or tool output), clamped to ~8000 chars. Shapes are fixed; three clients build against them.
+ */
+export function buildImportPreview(items: Array<{ type: string; data: any }>) {
+  const session = items.find((i) => i.type === 'session')?.data ?? null;
+  const messages = items.filter((i) => i.type === 'message').map((i) => i.data).sort((a, b) => (a?.time?.created ?? 0) - (b?.time?.created ?? 0));
+  const partsByMessage = new Map<string, any[]>();
+  for (const p of items.filter((i) => i.type === 'part').map((i) => i.data)) {
+    partsByMessage.set(p.messageID, [...(partsByMessage.get(p.messageID) ?? []), p]);
+  }
+  const partsOf = (m: any) => (partsByMessage.get(m?.id) ?? []).slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const userText = (m: any) => partsOf(m).filter(isText).map((p) => p.text.trim()).join('\n').trim();
+
+  // Model: prefer an assistant message that names provider+model, else a 'model' item.
+  let model: { providerID: string; modelID: string } | null = null;
+  for (const m of messages) if (m?.role === 'assistant' && m.providerID && m.modelID) { model = { providerID: String(m.providerID), modelID: String(m.modelID) }; break; }
+  if (!model) {
+    const mi = items.find((i) => i.type === 'model')?.data;
+    if (mi?.providerID && mi?.modelID) model = { providerID: String(mi.providerID), modelID: String(mi.modelID) };
+  }
+
+  const userMessages = messages.filter((m) => m?.role === 'user');
+  let seedPrompt = '';
+  for (const m of userMessages) { const t = userText(m); if (t) { seedPrompt = t; break; } }
+  const promptCount = userMessages.filter((m) => userText(m)).length;
+
+  const lines: string[] = [];
+  for (const m of messages) {
+    if (m?.role === 'user') {
+      const t = userText(m);
+      if (t) lines.push(`User: ${t}`);
+    } else if (m?.role === 'assistant') {
+      for (const p of partsOf(m)) {
+        if (isText(p)) lines.push(`Assistant: ${p.text.trim()}`);
+        else if (p?.type === 'tool') { const title = toolTitle(p); lines.push(`Assistant used ${p.tool || 'tool'}${title ? `: ${title}` : ''}`); }
+      }
+    }
+  }
+  const context = lines.join('\n').slice(0, IMPORT_CONTEXT_MAX);
+
+  const title = String(session?.title || 'Shared session');
+  const directory = String(session?.directory || '');
+  const base = directory.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || '';
+  return { title, projectName: base || title, model, promptCount, seedPrompt: seedPrompt.slice(0, IMPORT_CONTEXT_MAX), context };
+}
+
+export const shareImportRouter = new Hono<AppEnv>();
+shareImportRouter.use('*', requireUser);
+
+// GET /v1/shares/:id/import-preview — a signed-in user reads a safe seed to clone a shared session into their
+// own account (then creates it with the existing POST /v1/projects/:id/sessions). 404 if the share is gone.
+shareImportRouter.get('/:id/import-preview', async (c) => {
+  importRateLimit(c.get('user').id);
+  const id = c.req.param('id');
+  if (!(await db.get('SELECT 1 AS ok FROM shares WHERE id = ?', id))) throw notFound('Share');
+  return c.json({ data: buildImportPreview(await shareItems(id)) });
 });

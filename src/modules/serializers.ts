@@ -100,6 +100,11 @@ export function serializeSession(row: any) {
     starred: Boolean(Number(row.starred ?? 0)),
     changes: { additions: Number(row.additions), deletions: Number(row.deletions), files: Number(row.files) },
     pendingApprovals: Number(row.pending_approvals ?? 0),
+    // The account that owns (and runs) this session. Collaborators see it on every session they can read.
+    owner: { userId: row.user_id, email: row.owner_email ?? null, name: row.owner_name ?? null, avatar: row.owner_avatar ?? null },
+    // The reading user's role: 'owner' for their own sessions, otherwise the collaborator role they were given.
+    role: (row.my_role as 'owner' | 'chat' | 'viewer') ?? 'owner',
+    collaboratorCount: Number(row.collaborator_count ?? 0),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
