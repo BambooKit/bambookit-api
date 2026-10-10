@@ -17,6 +17,20 @@ const ACTIVE_SESSION_FOR_DEVICE = `
 export type PcSettings = { approvalMode: 'ask' | 'edits' | 'all'; keepAwake: boolean; allowRemoteControl: boolean };
 
 /** Settings a PC reported (approval mode, keep awake, remote control), or null for desktops that never reported any. */
+export interface DeviceApp {
+  id: string;
+  name: string;
+  version?: string | null;
+}
+
+/** The client app a desktop-class device runs in: BambooKit Desktop, or an editor extension. */
+export function deviceApp(row: { kind?: string; app?: string | null }): DeviceApp | null {
+  if (row.kind !== 'desktop' || !row.app) return null;
+  const a = parseJson<Partial<DeviceApp> | null>(row.app, null);
+  if (!a || !a.id) return null;
+  return { id: String(a.id), name: a.name ? String(a.name) : String(a.id), version: a.version ?? null };
+}
+
 export function deviceSettings(row: { kind?: string; settings?: string | null }): PcSettings | null {
   if (row.kind !== 'desktop' || !row.settings) return null;
   const s = parseJson<Partial<PcSettings> | null>(row.settings, null);
@@ -56,6 +70,8 @@ export async function serializeDevice(row: DeviceRow) {
     capabilities: row.kind === 'desktop' ? [...desktopCapabilities(row)].sort() : null,
     // Desktops: { approvalMode: 'ask' | 'edits' | 'all', keepAwake } as last reported by the PC; null if never reported.
     settings: deviceSettings(row),
+    // The app this desktop device runs in ({ id, name, version }) — for the phone's name + logo.
+    app: deviceApp(row),
     linkedDevices: links.map((l) => ({ id: l.id, name: l.name, kind: l.kind, platform: l.platform })),
     activeSession: active
       ? { id: active.id, title: active.title, status: active.status, projectName: active.project_name }

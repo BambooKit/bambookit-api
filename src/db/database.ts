@@ -385,6 +385,9 @@ async function migrate(d: Database) {
   await d.run('ALTER TABLE devices ADD COLUMN capabilities TEXT').catch(() => undefined);
   // Desktop settings the PC reports (JSON { approvalMode: 'ask'|'edits'|'all', keepAwake: boolean }); see modules/devices.ts.
   await d.run('ALTER TABLE devices ADD COLUMN settings TEXT').catch(() => undefined);
+  // The client app a desktop-class device runs in (JSON { id, name, version }): BambooKit Desktop,
+  // or an editor extension — VS Code, Cursor, Windsurf, Antigravity. The phone shows its name + logo.
+  await d.run('ALTER TABLE devices ADD COLUMN app TEXT').catch(() => undefined);
   // Who resolved an approval and when ('phone'|'web'|'pc'|'auto'); 'auto' = the PC approved it itself (Auto / Auto-approve mode).
   await d.run('ALTER TABLE approvals ADD COLUMN resolved_by TEXT').catch(() => undefined);
   // Provider API keys set or removed on a PC (succeeded commands), for the Secure Actions achievement.

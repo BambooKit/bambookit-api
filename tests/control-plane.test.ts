@@ -150,6 +150,20 @@ describe('desktop registration', () => {
     expect((await call('POST', '/v1/devices/register', { token, body, keys })).status).toBe(200);
   });
 
+  it('stores and returns the client app (editor) so the phone can show its name and logo', async () => {
+    const token = await tokenFor('user-reg-app', 'app@example.com');
+    const keys = desktopKeys();
+    const withApp = { kind: 'desktop', name: 'DESKTOP — Cursor', platform: 'windows', publicKey: keys.publicPem, app: { id: 'cursor', name: 'Cursor', version: '0.42.0' } };
+    const reg = await call('POST', '/v1/devices/register', { token, body: withApp, keys });
+    expect(reg.status).toBe(201);
+    expect(reg.json.data.app).toEqual({ id: 'cursor', name: 'Cursor', version: '0.42.0' });
+    const list = await call('GET', '/v1/devices', { token });
+    expect(list.json.data.find((d: any) => d.id === reg.json.data.id)?.app?.id).toBe('cursor');
+    // Re-registering without `app` keeps the stored one (never clears it).
+    const again = await call('POST', '/v1/devices/register', { token, body: { kind: 'desktop', name: 'DESKTOP — Cursor', platform: 'windows', publicKey: keys.publicPem }, keys });
+    expect(again.json.data.app?.id).toBe('cursor');
+  });
+
   it('rejects unsigned device-channel requests', async () => {
     const token = await tokenFor('user-reg-2', 'r2@example.com');
     const desktop = await setupDesktop(token);

@@ -19,6 +19,7 @@ export interface DeviceRow {
   protocol?: number | null;
   capabilities?: string | null;
   settings?: string | null;
+  app?: string | null;
   push_token: string | null;
   last_seen_at: string | null;
   created_at: string;

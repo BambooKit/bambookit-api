@@ -25,6 +25,9 @@ const registerSchema = z.discriminatedUnion('kind', [
     encryptionKey: z.string().min(200).max(4000).optional(),
     protocol: z.number().int().min(1).max(1000).optional(),
     capabilities: z.array(z.string().max(60)).max(100).optional(),
+    // The app this device runs in ({ id, name, version }): BambooKit Desktop, or an editor extension
+    // (VS Code, Cursor, Windsurf, Antigravity). Shown on the phone with the matching name and logo.
+    app: z.object({ id: z.string().min(1).max(40), name: z.string().min(1).max(60), version: z.string().max(40).optional() }).optional(),
     // API 1.3: the PC's approval mode, keep-awake state and remote-control switch (missing fields keep what was
     // reported before). allowRemoteControl can only be turned on physically at the PC, so it is reported, never set remotely.
     settings: z.object({ approvalMode: z.enum(['ask', 'edits', 'all']), keepAwake: z.boolean(), allowRemoteControl: z.boolean() }).partial().optional(),
@@ -110,6 +113,11 @@ devicesRouter.post('/register', async (c) => {
     if (existing && JSON.stringify(before) !== JSON.stringify(settings)) {
       emitEphemeral({ userId: user.id, deviceId: id, type: 'device.updated', payload: { deviceId: id, settings } });
     }
+  }
+
+  // The client app ({ id, name, version }) is stored only when reported, so re-registering without it never clears it.
+  if (body.kind === 'desktop' && body.app) {
+    await db.run('UPDATE devices SET app = ? WHERE id = ?', JSON.stringify(body.app), id);
   }
 
   const device = await serializeDevice((await getDevice(id))!);
